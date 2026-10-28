@@ -4,6 +4,7 @@ import json
 import os
 import io
 import math
+import copy
 from ortools.sat.python import cp_model
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -12,13 +13,19 @@ st.set_page_config(page_title="Shift Scheduler Pro", layout="wide")
 st.title("📋 Αυτόματο Πρόγραμμα Βαρδιών")
 
 DAYS = ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή"]
-ROLES = ["Service", "Bar", "Υποδοχή"]
+ROLES = ["Bar", "Service", "Υποδοχή"]
 HOURS = list(range(11, 26))  # 11:00 έως 25 (01:00)
 DATA_FILE = "scheduler_data.json"
 
 DEFAULT_STAFF = [
     "Άρης", "Γιάννης", "Κώστας", "Βαγγέλης", "Μαρία",
     "Φωτεινή", "Θεόφιλος", "Σαλώμη", "Ευαγγελία", "Faith", "Ραφαήλ"
+]
+
+STANDARD_SLOTS = [
+    {"label": "11:00 - 18:00", "start": 11, "end": 18, "duration": 7},
+    {"label": "18:00 - 22:00", "start": 18, "end": 22, "duration": 4},
+    {"label": "22:00 - 01:00", "start": 22, "end": 25, "duration": 3}
 ]
 
 def format_hour(h):
@@ -29,12 +36,34 @@ def format_hour(h):
     else:
         return "01:00"
 
-def parse_hour(h_str):
-    if str(h_str) == "01:00":
-        return 25
-    if str(h_str) == "00:00":
-        return 24
-    return int(str(h_str).split(":")[0])
+def get_slot_bounds(slot_str):
+    for s in STANDARD_SLOTS:
+        if s["label"] == slot_str:
+            return s["start"], s["end"], s["duration"]
+    parts = slot_str.split(" - ")
+    s_val = int(parts[0].split(":")[0])
+    e_raw = parts[1].split(":")[0]
+    e_val = 25 if e_raw in ["01", "1"] else (24 if e_raw in ["00", "0"] else int(e_raw))
+    return s_val, e_val, (e_val - s_val)
+
+# ---------------------------------------------------------
+# ΑΡΧΙΚΗ ΒΑΣΗ ΖΩΝΩΝ (ΒΑΣΙΣΜΕΝΗ ΣΤΗ ΦΩΤΟΓΡΑΦΙΑ)
+# ---------------------------------------------------------
+def get_initial_base_matrix():
+    return [
+        # Bar
+        {"Πόστο": "Bar", "Ωράριο": "11:00 - 18:00", "⚓ Ναυτολόγηση": "Όχι", "Δευτέρα": 1, "Τρίτη": 1, "Τετάρτη": 1, "Πέμπτη": 1, "Παρασκευή": 1, "Σάββατο": 1, "Κυριακή": 1},
+        {"Πόστο": "Bar", "Ωράριο": "18:00 - 22:00", "⚓ Ναυτολόγηση": "Όλες τις ημέρες", "Δευτέρα": 2, "Τρίτη": 2, "Τετάρτη": 2, "Πέμπτη": 2, "Παρασκευή": 2, "Σάββατο": 2, "Κυριακή": 2},
+        {"Πόστο": "Bar", "Ωράριο": "22:00 - 01:00", "⚓ Ναυτολόγηση": "Όλες τις ημέρες", "Δευτέρα": 1, "Τρίτη": 1, "Τετάρτη": 1, "Πέμπτη": 1, "Παρασκευή": 1, "Σάββατο": 1, "Κυριακή": 1},
+        # Service
+        {"Πόστο": "Service", "Ωράριο": "11:00 - 18:00", "⚓ Ναυτολόγηση": "Όχι", "Δευτέρα": 1, "Τρίτη": 1, "Τετάρτη": 1, "Πέμπτη": 1, "Παρασκευή": 1, "Σάββατο": 1, "Κυριακή": 1},
+        {"Πόστο": "Service", "Ωράριο": "18:00 - 22:00", "⚓ Ναυτολόγηση": "Όλες τις ημέρες", "Δευτέρα": 2, "Τρίτη": 2, "Τετάρτη": 2, "Πέμπτη": 2, "Παρασκευή": 2, "Σάββατο": 2, "Κυριακή": 2},
+        {"Πόστο": "Service", "Ωράριο": "22:00 - 01:00", "⚓ Ναυτολόγηση": "Όλες τις ημέρες", "Δευτέρα": 1, "Τρίτη": 1, "Τετάρτη": 1, "Πέμπτη": 1, "Παρασκευή": 1, "Σάββατο": 1, "Κυριακή": 1},
+        # Υποδοχή
+        {"Πόστο": "Υποδοχή", "Ωράριο": "11:00 - 18:00", "⚓ Ναυτολόγηση": "Όχι", "Δευτέρα": 1, "Τρίτη": 1, "Τετάρτη": 1, "Πέμπτη": 1, "Παρασκευή": 1, "Σάββατο": 1, "Κυριακή": 1},
+        {"Πόστο": "Υποδοχή", "Ωράριο": "18:00 - 22:00", "⚓ Ναυτολόγηση": "Όχι", "Δευτέρα": 1, "Τρίτη": 1, "Τετάρτη": 1, "Πέμπτη": 1, "Παρασκευή": 2, "Σάββατο": 2, "Κυριακή": 1},
+        {"Πόστο": "Υποδοχή", "Ωράριο": "22:00 - 01:00", "⚓ Ναυτολόγηση": "Όχι", "Δευτέρα": 1, "Τρίτη": 1, "Τετάρτη": 1, "Πέμπτη": 1, "Παρασκευή": 1, "Σάββατο": 1, "Κυριακή": 1},
+    ]
 
 # ---------------------------------------------------------
 # ΜΟΝΙΜΗ ΑΠΟΘΗΚΕΥΣΗ (JSON)
@@ -44,8 +73,9 @@ def load_persistent_data():
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if "employees" in data and "zones" in data:
-                    return data["employees"], data["zones"]
+                if "employees" in data and "base_matrix" in data:
+                    active = data.get("active_matrix", copy.deepcopy(data["base_matrix"]))
+                    return data["employees"], data["base_matrix"], active
         except Exception:
             pass
 
@@ -53,122 +83,135 @@ def load_persistent_data():
         {
             "id": i + 1,
             "name": name,
-            "role": "Service" if i % 3 == 0 else ("Bar" if i % 3 == 1 else "Υποδοχή"),
-            "is_marine": True if i in [0, 1, 4, 6] else False,
+            "role": "Bar" if i in [0, 1, 4, 7] else ("Service" if i in [2, 3, 5, 8] else "Υποδοχή"),
+            "is_marine": True if i in [0, 1, 2, 4, 7] else False,
             "target_shifts": 5,
             "unavailability": {d: {"status": "available", "start": 11, "end": 17} for d in DAYS}
         }
         for i, name in enumerate(DEFAULT_STAFF)
     ]
-    default_zones = [
-        {"id": 1, "day": "Όλες", "role": "Service", "start": 11, "end": 18, "min_staff": 1, "require_marine": False},
-        {"id": 2, "day": "Όλες", "role": "Service", "start": 18, "end": 25, "min_staff": 2, "require_marine": True},
-        {"id": 3, "day": "Όλες", "role": "Bar", "start": 11, "end": 18, "min_staff": 1, "require_marine": False},
-        {"id": 4, "day": "Όλες", "role": "Bar", "start": 18, "end": 25, "min_staff": 2, "require_marine": True},
-        {"id": 5, "day": "Όλες", "role": "Υποδοχή", "start": 19, "end": 24, "min_staff": 1, "require_marine": False},
-    ]
-    save_persistent_data(default_employees, default_zones)
-    return default_employees, default_zones
+    base_m = get_initial_base_matrix()
+    active_m = copy.deepcopy(base_m)
+    save_persistent_data(default_employees, base_m, active_m)
+    return default_employees, base_m, active_m
 
-def save_persistent_data(employees, zones):
-    # Μόνιμη ταξινόμηση ζωνών ανά Πόστο πριν την αποθήκευση
-    zones.sort(key=lambda z: (ROLES.index(z["role"]) if z["role"] in ROLES else 99, z["day"], z["start"]))
-    data = {"employees": employees, "zones": zones}
+def save_persistent_data(employees, base_matrix, active_matrix):
+    data = {
+        "employees": employees,
+        "base_matrix": base_matrix,
+        "active_matrix": active_matrix
+    }
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-if "employees" not in st.session_state or "zones" not in st.session_state:
-    loaded_emps, loaded_zones = load_persistent_data()
+if "employees" not in st.session_state or "base_matrix" not in st.session_state:
+    loaded_emps, loaded_base, loaded_active = load_persistent_data()
     st.session_state.employees = loaded_emps
-    st.session_state.zones = loaded_zones
+    st.session_state.base_matrix = loaded_base
+    st.session_state.active_matrix = loaded_active
 
 if "matrix_schedule" not in st.session_state:
     st.session_state.matrix_schedule = None
 
 # ---------------------------------------------------------
-# ΕΞΑΓΩΓΗ ΣΕ ΕΓΧΡΩΜΟ EXCEL (.XLSX)
+# ΥΠΟΛΟΓΙΣΜΟΣ KPIs ΓΙΑ ΤΟΝ MANAGER
 # ---------------------------------------------------------
-def create_styled_excel(df):
-    """Δημιουργεί έγχρωμο Excel με τα ακριβή χρώματα της φωτογραφίας ανά πόστο."""
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Πρόγραμμα Βαρδιών"
+def calculate_role_kpis(matrix, employees):
+    kpis = {}
+    for r in ROLES:
+        staff_r = [e for e in employees if e["role"] == r]
+        marines_r = [e for e in staff_r if e["is_marine"]]
+        role_rows = [row for row in matrix if row["Πόστο"] == r]
 
-    # Χρώματα ανά ρόλο βάσει φωτογραφίας (Hex)
-    role_hex_colors = {
-        "Service": "FCE5CD",   # Απαλό Πορτοκαλί / Ροδακινί
-        "Bar": "CFE2F3",       # Απαλό Γαλάζιο
-        "Υποδοχή": "FFF2CC"    # Απαλό Κίτρινο
-    }
+        total_hours = 0
+        min_shifts_week = 0
 
-    thin_border = Border(
-        left=Side(style='thin', color='A6A6A6'),
-        right=Side(style='thin', color='A6A6A6'),
-        top=Side(style='thin', color='A6A6A6'),
-        bottom=Side(style='thin', color='A6A6A6')
-    )
+        for d in DAYS:
+            daily_hours = 0
+            closing_staff = 0
+            early_staff = 0
 
-    header_font = Font(name='Arial', size=11, bold=True, color='000000')
-    header_fill = PatternFill(start_color='F3F3F3', end_color='F3F3F3', fill_type='solid')
-    bold_repo_font = Font(name='Arial', size=10, bold=True, color='7F6000')
-    regular_font = Font(name='Arial', size=10, bold=False, color='000000')
-    emp_font = Font(name='Arial', size=10, bold=True, color='000000')
+            for row in role_rows:
+                s_val, e_val, dur = get_slot_bounds(row["Ωράριο"])
+                needed = int(row.get(d, 0))
+                daily_hours += (needed * dur)
 
-    # Εγγραφή Κεφαλίδων (Headers)
-    headers = list(df.columns)
-    ws.append(headers)
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal='center', vertical='center')
-        cell.border = thin_border
+                if s_val == 11:
+                    early_staff = max(early_staff, needed)
+                if e_val == 25:
+                    closing_staff = max(closing_staff, needed)
 
-    # Εγγραφή Δεδομένων με Background Χρώμα ανά Ρόλο
-    for r_idx, row in df.iterrows():
-        ws.append(list(row))
-        curr_row = r_idx + 2
+            total_hours += daily_hours
+            shifts_today = max(math.ceil(daily_hours / 10.0), closing_staff + early_staff)
+            min_shifts_week += shifts_today
+
+        avail_shifts = sum(e["target_shifts"] for e in staff_r)
+        avail_mar_shifts = sum(e["target_shifts"] for e in marines_r)
+
+        if avail_shifts < min_shifts_week:
+            status = "🔴 Έλλειψη Προσωπικού"
+            badge = "red"
+        elif avail_shifts == min_shifts_week:
+            status = "⚠️ Οριακό (0 Slack)"
+            badge = "orange"
+        else:
+            status = "🟢 Πλήρης Κάλυψη"
+            badge = "green"
+
+        kpis[r] = {
+            "staff_count": len(staff_r),
+            "marine_count": len(marines_r),
+            "hours": total_hours,
+            "needed_shifts": min_shifts_week,
+            "avail_shifts": avail_shifts,
+            "avail_mar_shifts": avail_mar_shifts,
+            "status": status,
+            "badge": badge
+        }
+    return kpis
+
+# ---------------------------------------------------------
+# CONVERT MATRIX TO SOLVER REQUIREMENTS
+# ---------------------------------------------------------
+def matrix_to_requirements(matrix):
+    reqs = []
+    for row in matrix:
         role = row["Πόστο"]
-        bg_hex = role_hex_colors.get(role, "FFFFFF")
-        fill_color = PatternFill(start_color=bg_hex, end_color=bg_hex, fill_type='solid')
+        s_val, e_val, _ = get_slot_bounds(row["Ωράριο"])
+        mar_rule = row.get("⚓ Ναυτολόγηση", "Όχι")
 
-        for c_idx, col_name in enumerate(headers, start=1):
-            cell = ws.cell(row=curr_row, column=c_idx)
-            cell.fill = fill_color
-            cell.border = thin_border
-            val_str = str(cell.value)
+        for d in DAYS:
+            staff_count = int(row.get(d, 0))
+            if staff_count > 0:
+                is_mar = False
+                if mar_rule == "Όλες τις ημέρες":
+                    is_mar = True
+                elif mar_rule == "Μόνο Παρ - Κυρ" and d in ["Παρασκευή", "Σάββατο", "Κυριακή"]:
+                    is_mar = True
+                elif mar_rule == "Μόνο Δευτ - Πεμ" and d in ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη"]:
+                    is_mar = True
 
-            if col_name in ["Εργαζόμενος", "Πόστο"]:
-                cell.font = emp_font
-                cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
-            else:
-                cell.alignment = Alignment(horizontal='center', vertical='center')
-                if val_str == "ΡΕΠΟ":
-                    cell.font = bold_repo_font
-                else:
-                    cell.font = regular_font
-
-    # Ρύθμιση πλάτους στηλών
-    for col in ws.columns:
-        col_letter = col[0].column_letter
-        ws.column_dimensions[col_letter].width = 17
-
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
+                reqs.append({
+                    "role": role,
+                    "day": d,
+                    "start": s_val,
+                    "end": e_val,
+                    "min_staff": staff_count,
+                    "require_marine": is_mar
+                })
+    return reqs
 
 # ---------------------------------------------------------
-# ΜΟΝΑΔΙΑΙΟΣ SOLVER & ΔΙΑΓΝΩΣΗ
+# SOLVER & DIAGNOSTICS ΑΝΑ ΡΟΛΟ
 # ---------------------------------------------------------
-def solve_single_role(role, employees, zones, relax=None):
+def solve_single_role_from_reqs(role, employees, all_reqs, relax=None):
     staff_r = [e for e in employees if e["role"] == role]
-    zones_r = [z for z in zones if z["role"] == role]
+    reqs_r = [r for r in all_reqs if r["role"] == role]
 
-    if not zones_r:
-        return cp_model.OPTIMAL, [], []
+    if not reqs_r:
+        return cp_model.OPTIMAL, []
     if not staff_r:
-        return cp_model.INFEASIBLE, [], ["Δεν υπάρχει κανένας υπάλληλος καταχωρημένος σε αυτό το πόστο!"]
+        return cp_model.INFEASIBLE, []
 
     model = cp_model.CpModel()
     x = {}
@@ -180,10 +223,10 @@ def solve_single_role(role, employees, zones, relax=None):
     works_day = {}
     for e in staff_r:
         for d in DAYS:
-            works_day[(e["id"], d)] = model.NewBoolVar(f"works_{e['id']}_{d}")
-            hours_worked = [x[(e["id"], d, h)] for h in range(11, 25)]
-            model.Add(sum(hours_worked) >= 1).OnlyEnforceIf(works_day[(e["id"], d)])
-            model.Add(sum(hours_worked) == 0).OnlyEnforceIf(works_day[(e["id"], d)].Not())
+            works_day[(e["id"], d)] = model.NewBoolVar(f"w_{e['id']}_{d}")
+            h_worked = [x[(e["id"], d, h)] for h in range(11, 25)]
+            model.Add(sum(h_worked) >= 1).OnlyEnforceIf(works_day[(e["id"], d)])
+            model.Add(sum(h_worked) == 0).OnlyEnforceIf(works_day[(e["id"], d)].Not())
 
         avail_count = sum(1 for d in DAYS if e["unavailability"][d]["status"] != "all_day")
         eff_max = min(e["target_shifts"], avail_count)
@@ -221,13 +264,12 @@ def solve_single_role(role, employees, zones, relax=None):
             model.Add(sum(starts) <= 1)
 
     marines_r = [e for e in staff_r if e["is_marine"]]
-    for z in zones_r:
-        t_days = DAYS if z["day"] == "Όλες" else [z["day"]]
-        for d in t_days:
-            for h in range(z["start"], z["end"]):
-                model.Add(sum(x[(e["id"], d, h)] for e in staff_r) >= z["min_staff"])
-                if z["require_marine"] and relax != "no_marine":
-                    model.Add(sum(x[(e["id"], d, h)] for e in marines_r) >= 1)
+    for rq in reqs_r:
+        d = rq["day"]
+        for h in range(rq["start"], rq["end"]):
+            model.Add(sum(x[(e["id"], d, h)] for e in staff_r) >= rq["min_staff"])
+            if rq["require_marine"] and relax != "no_marine":
+                model.Add(sum(x[(e["id"], d, h)] for e in marines_r) >= 1)
 
     total_h = sum(x[(e["id"], d, h)] for e in staff_r for d in DAYS for h in range(11, 25))
     model.Minimize(total_h)
@@ -248,33 +290,97 @@ def solve_single_role(role, employees, zones, relax=None):
                         "role": e["role"],
                         "shift": f"{format_hour(min(w))}-{format_hour(max(w) + 1)}"
                     })
-    return status, res, []
+    return status, res
 
-def diagnose_role_failure(role, employees, zones):
+def diagnose_role_failure(role, employees, all_reqs):
     reasons = []
-    st_min, _, _ = solve_single_role(role, employees, zones, relax="no_min_shifts")
+    st_min, _ = solve_single_role_from_reqs(role, employees, all_reqs, relax="no_min_shifts")
     if st_min in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        reasons.append("📉 **Πλεόνασμα Προσωπικού / Υποχρεωτικά Μεροκάματα:** Ο αλγόριθμος υποχρεώνεται να δώσει σε όλους τουλάχιστον (Στόχος - 1) μεροκάματα, αλλά οι βάρδιες του μαγαζιού είναι λιγότερες! Μειώστε τα επιθυμητά μεροκάματα ορισμένων υπαλλήλων.")
+        reasons.append("📉 **Πλεόνασμα Προσωπικού / Υποχρεωτικά Μεροκάματα:** Ο αλγόριθμος αναγκάζεται να δώσει σε όλους τουλάχιστον (Στόχος - 1) μεροκάματα, αλλά οι βάρδιες του μαγαζιού είναι λιγότερες! Μειώστε τα μεροκάματα ορισμένων υπαλλήλων.")
 
-    st_mar, _, _ = solve_single_role(role, employees, zones, relax="no_marine")
+    st_mar, _ = solve_single_role_from_reqs(role, employees, all_reqs, relax="no_marine")
     if st_mar in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        reasons.append("⚓ **Περιορισμός Ναυτολογημένων:** Οι ναυτολογημένοι εργαζόμενοι δεν επαρκούν ή έχουν δηλώσει κώλυμα στις ναυτολογημένες ζώνες. Ορίστε επιπλέον ναυτολογημένο ή αφαιρέστε την απαίτηση από πρωινές ζώνες.")
+        reasons.append("⚓ **Περιορισμός Ναυτολογημένων:** Οι ναυτολογημένοι δεν επαρκούν για τις ζώνες με σήμανση ναυτολόγησης ή έχουν κώλυμα. Ορίστε επιπλέον ναυτολογημένο ή αφαιρέστε την απαίτηση.")
 
-    st_un, _, _ = solve_single_role(role, employees, zones, relax="no_unavail")
+    st_un, _ = solve_single_role_from_reqs(role, employees, all_reqs, relax="no_unavail")
     if st_un in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        reasons.append("🚫 **Σύγκρουση Κωλυμάτων:** Τα ρεπό ή οι ώρες κωλυμάτων συμπίπτουν και αφήνουν το μαγαζί χωρίς κάλυψη.")
+        reasons.append("🚫 **Σύγκρουση Κωλυμάτων:** Τα ρεπό ή οι ώρες κωλυμάτων των υπαλλήλων συμπίπτουν.")
 
-    st_h, _, _ = solve_single_role(role, employees, zones, relax="no_min_hours")
-    if st_h in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        reasons.append("⏱️ **Ελάχιστη Βάρδια 5 Ωρών:** Κάποια ζώνη είναι μικρότερη από 5 ώρες ή κάποιο κώλυμα αφήνει λιγότερο από 5ωρο ελεύθερο.")
-
-    st_max, _, _ = solve_single_role(role, employees, zones, relax="no_max_shifts")
+    st_max, _ = solve_single_role_from_reqs(role, employees, all_reqs, relax="no_max_shifts")
     if st_max in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        reasons.append("📈 **Έλλειψη Μεροκάματων:** Οι υπάλληλοι δεν φτάνουν για να καλύψουν όλες τις βάρδιες. Αυξήστε τα μεροκάματα σε 1-2 άτομα ή προσθέστε προσωπικό.")
+        reasons.append("📈 **Έλλειψη Μεροκάματων:** Οι υπάλληλοι δεν φτάνουν για να καλύψουν όλες τις βάρδιες χωρίς υπέρβαση των μεροκάματων τους.")
 
     if not reasons:
-        reasons.append("⚠️ **Σύνθετη Σύγκρουση:** Συνδυασμός οριακού αριθμού ατόμων και αυστηρών ωραρίων.")
+        reasons.append("⚠️ **Σύνθετη Σύγκρουση Περιορισμών:** Συνδυασμός οριακών ατόμων και ωραρίων.")
     return reasons
+
+# ---------------------------------------------------------
+# ΕΓΧΡΩΜΟ EXCEL EXPORT
+# ---------------------------------------------------------
+def create_styled_excel(df):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Πρόγραμμα Βαρδιών"
+
+    role_hex_colors = {
+        "Service": "FCE5CD",
+        "Bar": "CFE2F3",
+        "Υποδοχή": "FFF2CC"
+    }
+
+    thin_border = Border(
+        left=Side(style='thin', color='A6A6A6'),
+        right=Side(style='thin', color='A6A6A6'),
+        top=Side(style='thin', color='A6A6A6'),
+        bottom=Side(style='thin', color='A6A6A6')
+    )
+
+    header_font = Font(name='Arial', size=11, bold=True, color='000000')
+    header_fill = PatternFill(start_color='F3F3F3', end_color='F3F3F3', fill_type='solid')
+    bold_repo_font = Font(name='Arial', size=10, bold=True, color='7F6000')
+    regular_font = Font(name='Arial', size=10, bold=False, color='000000')
+    emp_font = Font(name='Arial', size=10, bold=True, color='000000')
+
+    headers = list(df.columns)
+    ws.append(headers)
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = thin_border
+
+    for r_idx, row in df.iterrows():
+        ws.append(list(row))
+        curr_row = r_idx + 2
+        role = row["Πόστο"]
+        bg_hex = role_hex_colors.get(role, "FFFFFF")
+        fill_color = PatternFill(start_color=bg_hex, end_color=bg_hex, fill_type='solid')
+
+        for c_idx, col_name in enumerate(headers, start=1):
+            cell = ws.cell(row=curr_row, column=c_idx)
+            cell.fill = fill_color
+            cell.border = thin_border
+            val_str = str(cell.value)
+
+            if col_name in ["Εργαζόμενος", "Πόστο"]:
+                cell.font = emp_font
+                cell.alignment = Alignment(horizontal='left', vertical='center', indent=1)
+            else:
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+                if val_str == "ΡΕΠΟ":
+                    cell.font = bold_repo_font
+                else:
+                    cell.font = regular_font
+
+    for col in ws.columns:
+        col_letter = col[0].column_letter
+        ws.column_dimensions[col_letter].width = 17
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
 
 tab1, tab2, tab3 = st.tabs(["👤 Καρτέλα Υπαλλήλου", "⚙️ Ρυθμίσεις Manager (Ζώνες)", "📅 Τελικό Πρόγραμμα"])
 
@@ -309,7 +415,7 @@ with tab1:
                             "target_shifts": new_sh,
                             "unavailability": {d: {"status": "available", "start": 11, "end": 17} for d in DAYS}
                         })
-                        save_persistent_data(st.session_state.employees, st.session_state.zones)
+                        save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
                         st.success(f"Ο/Η {new_name} προστέθηκε επιτυχώς!")
                         st.rerun()
 
@@ -319,7 +425,7 @@ with tab1:
                 del_name = st.selectbox("Επιλέξτε υπάλληλο προς διαγραφή:", [e["name"] for e in st.session_state.employees], key="del_emp_select")
                 if st.button("❌ Οριστική Διαγραφή", type="secondary"):
                     st.session_state.employees = [e for e in st.session_state.employees if e["name"] != del_name]
-                    save_persistent_data(st.session_state.employees, st.session_state.zones)
+                    save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
                     st.success(f"Ο/Η {del_name} διαγράφηκε!")
                     st.rerun()
 
@@ -351,7 +457,7 @@ with tab1:
     with col_marine:
         new_marine = st.checkbox("Ναυτολογημένος/η", value=emp["is_marine"], key=f"ui_marine_{emp['id']}")
     with col_shifts:
-        new_shifts = st.slider("Επιθυμητά μεροκάματα εβδομάδας:", 1, 7, value=emp["target_shifts"], key=f"ui_shifts_{emp['id']}", help="Ανάθεση: [στόχος - 1] έως [στόχος] ημέρες.")
+        new_shifts = st.slider("Επιθυμητά μεροκάματα εβδομάδας:", 1, 7, value=emp["target_shifts"], key=f"ui_shifts_{emp['id']}")
 
     st.divider()
     st.markdown("### 📅 Αναλυτική Ρύθμιση ανά Ημέρα")
@@ -402,7 +508,7 @@ with tab1:
                 slider_val = st.session_state.get(f"ui_slider_{emp['id']}_{d}", (11, 17))
                 emp["unavailability"][d] = {"status": code, "start": slider_val[0], "end": slider_val[1]}
 
-            save_persistent_data(st.session_state.employees, st.session_state.zones)
+            save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
             st.success(f"🎉 Όλα τα στοιχεία για τον/την **{emp['name']}** αποθηκεύτηκαν μόνιμα!")
             st.rerun()
 
@@ -415,132 +521,228 @@ with tab1:
                 if f"ui_slider_{emp['id']}_{d}" in st.session_state:
                     st.session_state[f"ui_slider_{emp['id']}_{d}"] = (11, 17)
 
-            save_persistent_data(st.session_state.employees, st.session_state.zones)
+            save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
             st.info(f"Τα κωλύματα του/της {emp['name']} μηδενίστηκαν.")
             st.rerun()
 
 # ---------------------------------------------------------
-# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER (ΤΑΞΙΝΟΜΗΣΗ ΑΝΑ ΠΟΣΤΟ)
+# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER (ΒΑΣΗ / ΕΞΑΙΡΕΣΕΙΣ & MATRIX VIEW)
 # ---------------------------------------------------------
 with tab2:
-    st.subheader("Διαχείριση Ζωνών & Αναγκών Προσωπικού")
-    st.info("💡 Οι ζώνες είναι **ταξινομημένες ανά Πόστο** (Service ➔ Bar ➔ Υποδοχή). Κάντε διπλό κλικ σε οποιοδήποτε κελί για άμεση αλλαγή.")
+    st.subheader("Διαχείριση Αναγκών & Ζωνών Προσωπικού")
 
-    # Ταξινόμηση ζωνών ανά Πόστο
-    st.session_state.zones.sort(key=lambda z: (ROLES.index(z["role"]) if z["role"] in ROLES else 99, z["day"], z["start"]))
+    # 1. LIVE KPIS ΣΤΗΝ ΚΟΡΥΦΗ (FEATURE 5)
+    active_kpis = calculate_role_kpis(st.session_state.active_matrix, st.session_state.employees)
+    k1, k2, k3 = st.columns(3)
+    cols_k = [k1, k2, k3]
+    for idx, r in enumerate(ROLES):
+        kpi = active_kpis[r]
+        with cols_k[idx]:
+            st.markdown(f"#### 🏷️ {r}")
+            st.metric(
+                label=f"Ζήτηση: {kpi['hours']} ώρες | Προσωπικό: {kpi['staff_count']} άτομα",
+                value=f"{kpi['avail_shifts']} / {kpi['needed_shifts']} βάρδιες",
+                delta=f"{kpi['status']}",
+                delta_color="normal" if "Πλήρης" in kpi['status'] else "inverse"
+            )
 
-    zones_list_data = [
-        {
-            "ID": z["id"],
-            "Πόστο": z["role"],
-            "Ημέρα": z["day"],
-            "Έναρξη": format_hour(z["start"]),
-            "Λήξη": format_hour(z["end"]),
-            "Άτομα": z["min_staff"],
-            "Ναυτολογημένος": z["require_marine"]
-        }
-        for z in st.session_state.zones
-    ]
-    zones_df = pd.DataFrame(zones_list_data)
-    time_options = [format_hour(h) for h in HOURS]
+    st.divider()
 
-    edited_zones_df = st.data_editor(
-        zones_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "ID": st.column_config.NumberColumn("ID", disabled=True),
-            "Πόστο": st.column_config.SelectboxColumn("Πόστο", options=ROLES, required=True),
-            "Ημέρα": st.column_config.SelectboxColumn("Ημέρα", options=["Όλες"] + DAYS, required=True),
-            "Έναρξη": st.column_config.SelectboxColumn("Έναρξη", options=time_options[:-1], required=True),
-            "Λήξη": st.column_config.SelectboxColumn("Λήξη", options=time_options[1:], required=True),
-            "Άτομα": st.column_config.NumberColumn("Άτομα", min_value=1, max_value=10, step=1, required=True),
-            "Ναυτολογημένος": st.column_config.CheckboxColumn("Ναυτολογημένος", default=False)
-        },
-        key="zones_table_editor"
+    # 2. ΕΠΙΛΟΓΗ ΤΑΜΠΛΟ: ΒΑΣΗ VS ΕΞΑΙΡΕΣΕΙΣ ΕΒΔΟΜΑΔΑΣ
+    board_mode = st.radio(
+        "Επιλέξτε Ταμπλό προς Προβολή / Επεξεργασία:",
+        ["⚡ Πρόγραμμα Εβδομάδας (Εξαιρέσεις)", "📌 Βασικό Πρόγραμμα (Σταθερή Βάση)"],
+        horizontal=True
     )
 
-    updated_zones = []
-    for idx, row in edited_zones_df.iterrows():
-        s_val = parse_hour(str(row["Έναρξη"]))
-        e_val = parse_hour(str(row["Λήξη"]))
-        if s_val < e_val:
-            z_id = int(row["ID"]) if ("ID" in row and pd.notna(row["ID"])) else (idx + 1)
-            updated_zones.append({
-                "id": z_id,
-                "day": str(row["Ημέρα"]),
-                "role": str(row["Πόστο"]),
-                "start": s_val,
-                "end": e_val,
-                "min_staff": int(row["Άτομα"]),
-                "require_marine": bool(row["Ναυτολογημένος"])
-            })
+    is_base_mode = (board_mode == "📌 Βασικό Πρόγραμμα (Σταθερή Βάση)")
+    current_matrix = st.session_state.base_matrix if is_base_mode else st.session_state.active_matrix
 
-    if updated_zones != st.session_state.zones:
-        st.session_state.zones = updated_zones
-        save_persistent_data(st.session_state.employees, st.session_state.zones)
+    c_action1, c_action2 = st.columns([2, 1])
+    with c_action1:
+        if not is_base_mode:
+            is_different = (st.session_state.active_matrix != st.session_state.base_matrix)
+            if is_different:
+                st.info("🟡 **Ενεργές Εξαιρέσεις:** Το ταμπλό περιέχει αλλαγές για την τρέχουσα εβδομάδα σε σχέση με τη βάση.")
+            else:
+                st.success("🟢 **Σε συμφωνία με τη Βάση:** Δεν υπάρχουν τροποποιημένες εξαιρέσεις.")
+        else:
+            st.info("ℹ️ Επεξεργάζεστε τη **Μόνιμη Βάση**. Οι αλλαγές εδώ διατηρούνται σταθερές από εβδομάδα σε εβδομάδα.")
 
-    st.write("")
-    col_add, col_del = st.columns(2)
+    with c_action2:
+        if not is_base_mode:
+            if st.button("🧹 Καθαρισμός Εξαιρέσεων με 1 κλικ", type="secondary", use_container_width=True):
+                st.session_state.active_matrix = copy.deepcopy(st.session_state.base_matrix)
+                save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
+                st.success("Όλες οι εξαιρέσεις μηδενίστηκαν και επανήλθε η Βάση!")
+                st.rerun()
+        else:
+            if st.button("💾 Αποθήκευση ως Νέα Βάση", type="primary", use_container_width=True):
+                save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
+                st.success("Η Βάση αποθηκεύτηκε επιτυχώς!")
 
-    with col_add:
-        with st.expander("➕ Προσθήκη Νέας Ζώνης (Πολλαπλές Ημέρες)", expanded=False):
-            with st.form("add_zone_form"):
-                new_z_role = st.selectbox("Πόστο:", ROLES)
-                chosen_days = st.multiselect(
-                    "Ημέρες εφαρμογής:",
-                    options=["Όλες"] + DAYS,
-                    default=["Όλες"]
-                )
-                new_start, new_end = st.select_slider("Ωράριο Ζώνης:", options=HOURS, value=(18, 25), format_func=format_hour)
-                new_min_staff = st.number_input("Ελάχιστα απαιτούμενα άτομα:", min_value=1, max_value=10, value=2)
-                new_require_marine = st.checkbox("Απαιτείται τουλάχιστον 1 ναυτολογημένος")
-                
-                if st.form_submit_button("Αποθήκευση Νέας Ζώνης"):
-                    if not chosen_days:
-                        st.error("Επιλέξτε τουλάχιστον μία ημέρα ή 'Όλες'.")
-                    else:
-                        max_id = max([z["id"] for z in st.session_state.zones], default=0)
-                        days_to_apply = ["Όλες"] if "Όλες" in chosen_days else chosen_days
+    # 3. ΜΑΖΙΚΗ ΕΦΑΡΜΟΓΗ (ΔΕΥΤΕΡΑ - ΠΕΜΠΤΗ / CUSTOM)
+    with st.expander("⚡ Γρήγορη Μαζική Συμπλήρωση Ζωνών (Δευτέρα - Πέμπτη κ.α.)", expanded=False):
+        with st.form("bulk_fill_form"):
+            c_b1, c_b2, c_b3 = st.columns(3)
+            with c_b1:
+                b_role = st.selectbox("Πόστο:", ["Όλα τα Πόστα"] + ROLES)
+            with c_b2:
+                b_slot = st.selectbox("Ωράριο Ζώνης:", [s["label"] for s in STANDARD_SLOTS])
+            with c_b3:
+                b_marine = st.selectbox("⚓ Απαίτηση Ναυτολόγησης:", ["Όχι", "Όλες τις ημέρες", "Μόνο Παρ - Κυρ", "Μόνο Δευτ - Πεμ"])
 
-                        for d in days_to_apply:
-                            max_id += 1
-                            st.session_state.zones.append({
-                                "id": max_id,
-                                "day": d,
-                                "role": new_z_role,
-                                "start": new_start,
-                                "end": new_end,
-                                "min_staff": new_min_staff,
-                                "require_marine": new_require_marine
-                            })
+            c_b4, c_b5 = st.columns([2, 1])
+            with c_b4:
+                b_preset = st.radio("Πρότυπο Ημερών:", ["Δευτέρα - Πέμπτη", "Παρασκευή - Κυριακή", "Όλες οι Ημέρες", "Επιλογή Συγκεκριμένων Ημερών"], horizontal=True)
+                if b_preset == "Δευτέρα - Πέμπτη":
+                    chosen_bulk_days = ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη"]
+                elif b_preset == "Παρασκευή - Κυριακή":
+                    chosen_bulk_days = ["Παρασκευή", "Σάββατο", "Κυριακή"]
+                elif b_preset == "Όλες οι Ημέρες":
+                    chosen_bulk_days = DAYS
+                else:
+                    chosen_bulk_days = st.multiselect("Επιλέξτε ημέρες:", DAYS, default=DAYS)
+            with c_b5:
+                b_staff_count = st.number_input("Άτομα στη ζώνη:", min_value=0, max_value=10, value=2)
 
-                        save_persistent_data(st.session_state.employees, st.session_state.zones)
-                        if "zones_table_editor" in st.session_state:
-                            del st.session_state["zones_table_editor"]
-                        st.success(f"Προστέθηκαν επιτυχώς {len(days_to_apply)} ζώνες!")
-                        st.rerun()
+            if st.form_submit_button("⚡ Μαζική Ενημέρωση στον Πίνακα"):
+                target_roles = ROLES if b_role == "Όλα τα Πόστα" else [b_role]
+                target_mat = st.session_state.base_matrix if is_base_mode else st.session_state.active_matrix
 
-    with col_del:
-        with st.expander("🗑️ Άμεση Διαγραφή Ζώνης", expanded=False):
-            if st.session_state.zones:
-                zone_options_map = {
-                    z["id"]: f"ID {z['id']} | [{z['role']}] | {z['day']} | {format_hour(z['start'])}-{format_hour(z['end'])} ({z['min_staff']} άτομα)"
-                    for z in st.session_state.zones
-                }
-                zone_to_delete = st.selectbox(
-                    "Επιλέξτε τη ζώνη προς διαγραφή:",
-                    options=list(zone_options_map.keys()),
-                    format_func=lambda x: zone_options_map[x]
-                )
-                
-                if st.button("❌ Οριστική Διαγραφή Ζώνης", type="secondary"):
-                    st.session_state.zones = [z for z in st.session_state.zones if z["id"] != zone_to_delete]
-                    save_persistent_data(st.session_state.employees, st.session_state.zones)
-                    if "zones_table_editor" in st.session_state:
-                        del st.session_state["zones_table_editor"]
-                    st.success("Η ζώνη διαγράφηκε επιτυχώς!")
-                    st.rerun()
+                for row in target_mat:
+                    if row["Πόστο"] in target_roles and row["Ωράριο"] == b_slot:
+                        row["⚓ Ναυτολόγηση"] = b_marine
+                        for d in chosen_bulk_days:
+                            row[d] = int(b_staff_count)
+
+                save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
+                st.success("Ο πίνακας ενημερώθηκε επιτυχώς!")
+                st.rerun()
+
+    # 4. SUB-TABS ΑΝΑ ΠΟΣΤΟ (FEATURE 1) & MATRIX VIEW (FEATURE 4)
+    st.markdown("#### 📊 Ταμπλό Ζωνών ανά Πόστο (Matrix Format)")
+    sub_tab_all, sub_tab_bar, sub_tab_srv, sub_tab_ypo = st.tabs(["🌐 Όλα τα Πόστα (Ενοποιημένο)", "🍸 Bar", "🍽️ Service", "🛎️ Υποδοχή"])
+
+    marine_options = ["Όχι", "Όλες τις ημέρες", "Μόνο Παρ - Κυρ", "Μόνο Δευτ - Πεμ"]
+
+    def render_role_matrix_editor(filtered_df, key_suffix):
+        return st.data_editor(
+            filtered_df,
+            use_container_width=True,
+            num_rows="fixed",
+            column_config={
+                "Πόστο": st.column_config.TextColumn("Πόστο", disabled=True),
+                "Ωράριο": st.column_config.TextColumn("Ωράριο", disabled=True),
+                "⚓ Ναυτολόγηση": st.column_config.SelectboxColumn("⚓ Ναυτολόγηση", options=marine_options, required=True),
+                "Δευτέρα": st.column_config.NumberColumn("Δευτέρα", min_value=0, max_value=10, step=1, required=True),
+                "Τρίτη": st.column_config.NumberColumn("Τρίτη", min_value=0, max_value=10, step=1, required=True),
+                "Τετάρτη": st.column_config.NumberColumn("Τετάρτη", min_value=0, max_value=10, step=1, required=True),
+                "Πέμπτη": st.column_config.NumberColumn("Πέμπτη", min_value=0, max_value=10, step=1, required=True),
+                "Παρασκευή": st.column_config.NumberColumn("Παρασκευή", min_value=0, max_value=10, step=1, required=True),
+                "Σάββατο": st.column_config.NumberColumn("Σάββατο", min_value=0, max_value=10, step=1, required=True),
+                "Κυριακή": st.column_config.NumberColumn("Κυριακή", min_value=0, max_value=10, step=1, required=True),
+            },
+            key=f"zones_editor_{key_suffix}"
+        )
+
+    # Προβολή ανά tab
+    with sub_tab_all:
+        df_all = pd.DataFrame(current_matrix)
+        edited_all = render_role_matrix_editor(df_all, "all")
+        if not edited_all.equals(df_all):
+            new_mat = edited_all.to_dict('records')
+            if is_base_mode:
+                st.session_state.base_matrix = new_mat
+            else:
+                st.session_state.active_matrix = new_mat
+            save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
+            st.rerun()
+
+    with sub_tab_bar:
+        df_bar = pd.DataFrame([r for r in current_matrix if r["Πόστο"] == "Bar"])
+        edited_bar = render_role_matrix_editor(df_bar, "bar")
+        if not edited_bar.equals(df_bar):
+            bar_records = edited_bar.to_dict('records')
+            for i, r in enumerate(current_matrix):
+                if r["Πόστο"] == "Bar":
+                    match_rec = next((b for b in bar_records if b["Ωράριο"] == r["Ωράριο"]), None)
+                    if match_rec:
+                        current_matrix[i] = match_rec
+            save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
+            st.rerun()
+
+    with sub_tab_srv:
+        df_srv = pd.DataFrame([r for r in current_matrix if r["Πόστο"] == "Service"])
+        edited_srv = render_role_matrix_editor(df_srv, "srv")
+        if not edited_srv.equals(df_srv):
+            srv_records = edited_srv.to_dict('records')
+            for i, r in enumerate(current_matrix):
+                if r["Πόστο"] == "Service":
+                    match_rec = next((b for b in srv_records if b["Ωράριο"] == r["Ωράριο"]), None)
+                    if match_rec:
+                        current_matrix[i] = match_rec
+            save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
+            st.rerun()
+
+    with sub_tab_ypo:
+        df_ypo = pd.DataFrame([r for r in current_matrix if r["Πόστο"] == "Υποδοχή"])
+        edited_ypo = render_role_matrix_editor(df_ypo, "ypo")
+        if not edited_ypo.equals(df_ypo):
+            ypo_records = edited_ypo.to_dict('records')
+            for i, r in enumerate(current_matrix):
+                if r["Πόστο"] == "Υποδοχή":
+                    match_rec = next((b for b in ypo_records if b["Ωράριο"] == r["Ωράριο"]), None)
+                    if match_rec:
+                        current_matrix[i] = match_rec
+            save_persistent_data(st.session_state.employees, st.session_state.base_matrix, st.session_state.active_matrix)
+            st.rerun()
+
+    # 5. ΟΠΤΙΚΟΣ ΕΛΕΓΧΟΣ & ΧΡΩΜΑΤΙΚΗ ΣΗΜΑΝΣΗ ΝΑΥΤΟΛΟΓΗΣΗΣ (FEATURE 2)
+    st.markdown("#### 🎨 Οπτική Προεπισκόπηση & Σήμανση Ναυτολόγησης")
+    st.caption("🟦 Οι ζώνες με σήμανση ναυτολόγησης εμφανίζονται με έντονο γαλάζιο/μπλε και το σύμβολο ⚓.")
+
+    def style_matrix_marine(val):
+        return val
+
+    # Κατασκευή styled preview
+    preview_rows = []
+    for row in current_matrix:
+        p_row = {"Πόστο": row["Πόστο"], "Ωράριο": row["Ωράριο"]}
+        mar_rule = row.get("⚓ Ναυτολόγηση", "Όχι")
+        for d in DAYS:
+            count = row[d]
+            is_mar = False
+            if mar_rule == "Όλες τις ημέρες":
+                is_mar = True
+            elif mar_rule == "Μόνο Παρ - Κυρ" and d in ["Παρασκευή", "Σάββατο", "Κυριακή"]:
+                is_mar = True
+            elif mar_rule == "Μόνο Δευτ - Πεμ" and d in ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη"]:
+                is_mar = True
+
+            p_row[d] = f"{count} ⚓" if (is_mar and count > 0) else f"{count}"
+        preview_rows.append(p_row)
+
+    df_preview = pd.DataFrame(preview_rows)
+
+    def highlight_zones(row):
+        role = row["Πόστο"]
+        if role == "Bar":
+            base_color = "background-color: #CFE2F3; color: black;"
+        elif role == "Service":
+            base_color = "background-color: #FCE5CD; color: black;"
+        else:
+            base_color = "background-color: #FFF2CC; color: black;"
+
+        styles = []
+        for col_name, val in row.items():
+            if "⚓" in str(val):
+                styles.append("background-color: #A9CCE3; color: #003366; font-weight: bold; border: 1px solid #1B4F72;")
+            else:
+                styles.append(base_color)
+        return styles
+
+    st.dataframe(df_preview.style.apply(highlight_zones, axis=1), use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------
 # TAB 3: ΕΠΙΛΥΣΗ, ΕΓΧΡΩΜΟ FORMAT & EXCEL EXPORT
@@ -549,27 +751,26 @@ with tab3:
     st.subheader("Αυτόματη Δημιουργία & Επεξεργασία Προγράμματος")
 
     if st.button("🚀 Υπολογισμός Προγράμματος (OR-Tools)", type="primary"):
+        # Μετατροπή του ενεργού matrix σε απαιτήσεις του solver
+        active_reqs = matrix_to_requirements(st.session_state.active_matrix)
         all_shifts = []
         role_status_report = {}
         has_failure = False
 
         for r in ROLES:
-            status, res, _ = solve_single_role(r, st.session_state.employees, st.session_state.zones)
+            status, res = solve_single_role_from_reqs(r, st.session_state.employees, active_reqs)
             if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 all_shifts.extend(res)
                 role_status_report[r] = {"success": True, "reasons": []}
             else:
                 has_failure = True
-                reasons = diagnose_role_failure(r, st.session_state.employees, st.session_state.zones)
+                reasons = diagnose_role_failure(r, st.session_state.employees, active_reqs)
                 role_status_report[r] = {"success": False, "reasons": reasons}
 
         if not has_failure:
-            st.success("🎉 Το πρόγραμμα υπολογίστηκε επιτυχώς!")
+            st.success("🎉 Το πρόγραμμα υπολογίστηκε επιτυχώς βάσει του ενεργού ταμπλό!")
 
-            # 1. Κατασκευή του Matrix DataFrame (Όπως στη φωτογραφία)
             shift_dict = {(item["day"], item["name"]): item["shift"] for item in all_shifts}
-            
-            # Ταξινόμηση υπαλλήλων ανά Πόστο
             sorted_employees = sorted(
                 st.session_state.employees,
                 key=lambda e: (ROLES.index(e["role"]) if e["role"] in ROLES else 99, e["name"])
@@ -582,7 +783,6 @@ with tab3:
                     "Εργαζόμενος": e["name"]
                 }
                 for d in DAYS:
-                    # Αν έχει βάρδια, βάζουμε το ωράριο, αλλιώς ΡΕΠΟ
                     row_data[d] = shift_dict.get((d, e["name"]), "ΡΕΠΟ")
                 matrix_rows.append(row_data)
 
@@ -602,21 +802,14 @@ with tab3:
             st.markdown("### 📊 Συγκεντρωτικός Πίνακας Ανάλυσης")
             summary_table = []
             for r in ROLES:
-                staff_r = [e for e in st.session_state.employees if e["role"] == r]
-                zones_r = [z for z in st.session_state.zones if z["role"] == r]
-                total_h = sum(
-                    max([z["min_staff"] for z in zones_r if (z["day"] == "Όλες" or z["day"] == d) and z["start"] <= h < z["end"]], default=0)
-                    for d in DAYS for h in range(11, 25)
-                )
-                avail_shifts = sum(e["target_shifts"] for e in staff_r)
-                status_label = "✅ Εντάξει" if role_status_report[r]["success"] else "❌ Μπλοκάρει"
-
+                k = active_kpis[r]
                 summary_table.append({
                     "Πόστο": r,
-                    "Προσωπικό": f"{len(staff_r)} άτομα",
-                    "Ώρες Ζήτησης": f"{total_h} ώρες",
-                    "Διαθέσιμα Μεροκάματα": f"{avail_shifts} βάρδιες",
-                    "Κατάσταση": status_label
+                    "Προσωπικό": f"{k['staff_count']} άτομα ({k['marine_count']} ναυτ.)",
+                    "Ώρες Ζήτησης": f"{k['hours']} ώρες",
+                    "Απαιτούμενα Μεροκάματα": f"{k['needed_shifts']} βάρδιες",
+                    "Διαθέσιμα Μεροκάματα": f"{k['avail_shifts']} βάρδιες",
+                    "Κατάσταση": "✅ Εντάξει" if role_status_report[r]["success"] else "❌ Μπλοκάρει"
                 })
             st.dataframe(pd.DataFrame(summary_table), use_container_width=True, hide_index=True)
 
@@ -647,7 +840,6 @@ with tab3:
         )
         st.session_state.matrix_schedule = edited_matrix
 
-        # 2. ΕΞΑΓΩΓΗ ΣΕ ΕΓΧΡΩΜΟ EXCEL (.XLSX)
         excel_data = create_styled_excel(edited_matrix)
         st.download_button(
             label="📥 Λήψη σε Έγχρωμο Excel (.xlsx)",
@@ -657,17 +849,15 @@ with tab3:
             type="primary"
         )
 
-        # 3. ΕΓΧΡΩΜΗ ΠΡΟΕΠΙΣΚΟΠΗΣΗ HTML (ΑΚΡΙΒΩΣ ΟΠΩΣ ΣΤΗ ΦΩΤΟΓΡΑΦΙΑ)
         st.markdown("#### 🎨 Προεπισκόπηση με Χρώματα ανά Πόστο")
-        
         def highlight_roles(row):
             role = row["Πόστο"]
             if role == "Service":
-                bg = "background-color: #FCE5CD; color: black;"  # Απαλό Πορτοκαλί
+                bg = "background-color: #FCE5CD; color: black;"
             elif role == "Bar":
-                bg = "background-color: #CFE2F3; color: black;"  # Απαλό Μπλε
+                bg = "background-color: #CFE2F3; color: black;"
             else:
-                bg = "background-color: #FFF2CC; color: black;"  # Απαλό Κίτρινο
+                bg = "background-color: #FFF2CC; color: black;"
             return [bg] * len(row)
 
         styled_df = edited_matrix.style.apply(highlight_roles, axis=1)
