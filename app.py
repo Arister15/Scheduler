@@ -7,10 +7,10 @@ st.title("📋 Αυτόματο Πρόγραμμα Βαρδιών")
 
 DAYS = ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη", "Παρασκευή", "Σάββατο", "Κυριακή"]
 ROLES = ["Service", "Bar", "Υποδοχή"]
-HOURS = list(range(11, 26))  # 11 έως 25 (όπου 24 = 00:00, 25 = 01:00)
+HOURS = list(range(11, 26))  # 11:00 έως 25 (01:00)
 
 def format_hour(h):
-    """Μετατρέπει τον αριθμό ώρας σε κανονική μορφή ώρας (π.χ. 25 -> 01:00)."""
+    """Μετατρέπει τον αριθμό ώρας σε μορφή hh:00 (π.χ. 25 -> 01:00)."""
     if h < 24:
         return f"{h:02d}:00"
     elif h == 24:
@@ -34,7 +34,7 @@ if "employees" not in st.session_state:
             "role": "Service" if i % 3 == 0 else ("Bar" if i % 3 == 1 else "Υποδοχή"),
             "is_marine": True if i in [0, 1, 4, 6] else False,
             "target_shifts": 5,
-            "unavailability": []  # Λίστα από (day, start_hour, end_hour)
+            "unavailability": []
         }
         for i, name in enumerate(STAFF_NAMES)
     ]
@@ -74,10 +74,10 @@ with tab1:
     # Πολλαπλή επιλογή ημερών
     selected_days = st.multiselect("Επιλέξτε ημέρες κωλύματος:", DAYS, default=[])
     
-    u_start, u_end = st.slider(
+    # Χρήση select_slider για αποφυγή του TypeError
+    u_start, u_end = st.select_slider(
         "Χρονικό διάστημα κωλύματος:",
-        min_value=11,
-        max_value=25,
+        options=HOURS,
         value=(11, 16),
         format_func=format_hour
     )
@@ -89,7 +89,6 @@ with tab1:
                 st.warning("Παρακαλώ επιλέξτε τουλάχιστον μία ημέρα.")
             else:
                 for day in selected_days:
-                    # Αποφυγή διπλότυπων
                     if (day, u_start, u_end) not in emp["unavailability"]:
                         emp["unavailability"].append((day, u_start, u_end))
                 st.success(f"Καταχωρήθηκαν {len(selected_days)} κωλύματα για: {format_hour(u_start)} - {format_hour(u_end)}!")
@@ -99,7 +98,6 @@ with tab1:
             emp["unavailability"] = []
             st.info("Όλα τα κωλύματά σας διαγράφηκαν.")
 
-    # Προβολή καταχωρημένων κωλυμάτων
     if emp["unavailability"]:
         st.markdown("**Ενεργά κωλύματα:**")
         unavail_data = [{"Ημέρα": d, "Από": format_hour(s), "Έως": format_hour(e)} for d, s, e in emp["unavailability"]]
@@ -114,7 +112,6 @@ with tab2:
     st.subheader("Διαχείριση Ζωνών & Αναγκών Προσωπικού")
     st.caption("Ορίστε δυναμικά πόσα άτομα χρειάζονται ανά ώρα, ημέρα και πόστο.")
 
-    # 1. Πίνακας υφιστάμενων ζωνών
     if st.session_state.zones:
         display_zones = []
         for z in st.session_state.zones:
@@ -131,13 +128,17 @@ with tab2:
 
     col_add, col_edit_del = st.columns(2)
 
-    # 2. Προσθήκη νέας ζώνης
     with col_add:
         with st.expander("➕ Προσθήκη Νέας Ζώνης", expanded=False):
             with st.form("add_zone_form"):
                 new_day = st.selectbox("Ημέρα:", ["Όλες"] + DAYS)
                 new_role = st.selectbox("Πόστο:", ROLES)
-                new_start, new_end = st.slider("Ωράριο Ζώνης:", 11, 25, (18, 25), format_func=format_hour)
+                new_start, new_end = st.select_slider(
+                    "Ωράριο Ζώνης:",
+                    options=HOURS,
+                    value=(18, 25),
+                    format_func=format_hour
+                )
                 new_min_staff = st.number_input("Ελάχιστα απαιτούμενα άτομα:", min_value=1, max_value=10, value=2)
                 new_require_marine = st.checkbox("Απαιτείται τουλάχιστον 1 ναυτολογημένος")
                 
@@ -155,7 +156,6 @@ with tab2:
                     st.success("Η ζώνη προστέθηκε επιτυχώς!")
                     st.rerun()
 
-    # 3. Επεξεργασία & Διαγραφή Ζώνης
     with col_edit_del:
         with st.expander("✏️ Επεξεργασία / Διαγραφή Ζώνης", expanded=False):
             if st.session_state.zones:
@@ -166,7 +166,12 @@ with tab2:
                 with st.form("edit_zone_form"):
                     ed_day = st.selectbox("Ημέρα:", ["Όλες"] + DAYS, index=(["Όλες"] + DAYS).index(zone_to_edit["day"]))
                     ed_role = st.selectbox("Πόστο:", ROLES, index=ROLES.index(zone_to_edit["role"]))
-                    ed_start, ed_end = st.slider("Ωράριο Ζώνης:", 11, 25, (zone_to_edit["start"], zone_to_edit["end"]), format_func=format_hour)
+                    ed_start, ed_end = st.select_slider(
+                        "Ωράριο Ζώνης:",
+                        options=HOURS,
+                        value=(zone_to_edit["start"], zone_to_edit["end"]),
+                        format_func=format_hour
+                    )
                     ed_min_staff = st.number_input("Ελάχιστα απαιτούμενα άτομα:", min_value=1, max_value=10, value=zone_to_edit["min_staff"])
                     ed_require_marine = st.checkbox("Απαιτείται τουλάχιστον 1 ναυτολογημένος", value=zone_to_edit["require_marine"])
 
@@ -223,7 +228,7 @@ with tab3:
                     if h in range(11, 25):
                         model.Add(x[(e["id"], u_day, h)] == 0)
 
-            # Συνεχόμενο ωράριο (χωρίς σπαστά) & όρια βάρδιας (4 έως 8 ώρες)
+            # Συνεχόμενο ωράριο (όχι σπαστά) & όρια βάρδιας (4 έως 8 ώρες)
             for d in DAYS:
                 daily_h = [x[(e["id"], d, h)] for h in range(11, 25)]
                 model.Add(sum(daily_h) <= 8)
@@ -239,7 +244,7 @@ with tab3:
                     starts.append(start_var)
                 model.Add(sum(starts) <= 1)
 
-        # Επιβολή των Custom Ζωνών του Manager
+        # Επιβολή Custom Ζωνών Manager
         for zone in st.session_state.zones:
             target_days = DAYS if zone["day"] == "Όλες" else [zone["day"]]
             eligible_staff = [e for e in st.session_state.employees if e["role"] == zone["role"]]
@@ -247,11 +252,9 @@ with tab3:
 
             for d in target_days:
                 for h in range(zone["start"], zone["end"]):
-                    # Ελάχιστο προσωπικό στο συγκεκριμένο πόστο
                     staff_h = [x[(e["id"], d, h)] for e in eligible_staff]
                     model.Add(sum(staff_h) >= zone["min_staff"])
 
-                    # Απαίτηση ναυτολογημένου
                     if zone["require_marine"]:
                         marine_h = [x[(e["id"], d, h)] for e in marine_staff]
                         model.Add(sum(marine_h) >= 1)
@@ -282,7 +285,6 @@ with tab3:
             df_res = pd.DataFrame(results)
             st.dataframe(df_res, use_container_width=True)
 
-            # Προβολή ανά Ημέρα
             st.markdown("#### Αναλυτικό Πρόγραμμα ανά Ημέρα")
             for d in DAYS:
                 day_df = df_res[df_res["Ημέρα"] == d]
