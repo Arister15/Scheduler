@@ -10,7 +10,7 @@ ROLES = ["Service", "Bar", "Υποδοχή"]
 HOURS = list(range(11, 26))  # 11:00 έως 25 (01:00)
 
 def format_hour(h):
-    """Μετατρέπει τον αριθμό ώρας σε μορφή hh:00 (π.χ. 25 -> 01:00)."""
+    """Μετατρέπει τον αριθμό ώρας σε μορφή hh:00 (π.χ. 24 -> 00:00, 25 -> 01:00)."""
     if h < 24:
         return f"{h:02d}:00"
     elif h == 24:
@@ -34,10 +34,18 @@ if "employees" not in st.session_state:
             "role": "Service" if i % 3 == 0 else ("Bar" if i % 3 == 1 else "Υποδοχή"),
             "is_marine": True if i in [0, 1, 4, 6] else False,
             "target_shifts": 5,
-            "unavailability": []
+            # Αποθήκευση κωλυμάτων ανά συγκεκριμένη ημέρα
+            "unavailability": {
+                d: {"status": "available", "start": 11, "end": 17} for d in DAYS
+            }
         }
         for i, name in enumerate(STAFF_NAMES)
     ]
+else:
+    # Αυτόματη μετατροπή αν υπήρχε παλαιότερη δομή κωλυμάτων
+    for e in st.session_state.employees:
+        if not isinstance(e.get("unavailability"), dict):
+            e["unavailability"] = {d: {"status": "available", "start": 11, "end": 17} for d in DAYS}
 
 if "zones" not in st.session_state:
     st.session_state.zones = [
@@ -48,10 +56,13 @@ if "zones" not in st.session_state:
         {"id": 5, "day": "Όλες", "role": "Υποδοχή", "start": 19, "end": 24, "min_staff": 1, "require_marine": False},
     ]
 
+if "schedule_df" not in st.session_state:
+    st.session_state.schedule_df = None
+
 tab1, tab2, tab3 = st.tabs(["👤 Καρτέλα Υπαλλήλου", "⚙️ Ρυθμίσεις Manager (Ζώνες)", "📅 Τελικό Πρόγραμμα"])
 
 # ---------------------------------------------------------
-# TAB 1: ΚΑΡΤΕΛΑ ΥΠΑΛΛΗΛΟΥ
+# TAB 1: ΚΑΡΤΕΛΑ ΥΠΑΛΛΗΛΟΥ (CUSTOM ΩΡΕΣ ΑΝΑ ΗΜΕΡΑ)
 # ---------------------------------------------------------
 with tab1:
     st.subheader("Δήλωση Στοιχείων & Διαθεσιμότητας")
@@ -62,51 +73,73 @@ with tab1:
 
     col_role, col_marine, col_shifts = st.columns(3)
     with col_role:
-        emp["role"] = st.selectbox("Πόστο εργασίας:", ROLES, index=ROLES.index(emp["role"]))
+        emp["role"] = st.selectbox("Πόστο εργασίας:", ROLES, index=ROLES.index(emp["role"]), key=f"role_{emp['id']}")
     with col_marine:
-        emp["is_marine"] = st.checkbox("Ναυτολογημένος/η", value=emp["is_marine"])
+        emp["is_marine"] = st.checkbox("Ναυτολογημένος/η", value=emp["is_marine"], key=f"marine_{emp['id']}")
     with col_shifts:
-        emp["target_shifts"] = st.slider("Επιθυμητά μεροκάματα εβδομάδας:", 1, 7, emp["target_shifts"])
+        emp["target_shifts"] = st.slider("Επιθυμητά μεροκάματα εβδομάδας:", 1, 7, emp["target_shifts"], key=f"shifts_{emp['id']}")
 
     st.divider()
-    st.markdown("#### Καταχώρηση Κωλυμάτων (Ώρες που ΔΕΝ μπορείτε)")
+    st.markdown("#### 📅 Διαθεσιμότητα ανά Ημέρα")
+    st.caption("Ορίστε ξεχωριστά για κάθε ημέρα αν είστε διαθέσιμος/η, αν έχετε ρεπό, ή τις συγκεκριμένες ώρες κωλύματος:")
 
-    # Πολλαπλή επιλογή ημερών
-    selected_days = st.multiselect("Επιλέξτε ημέρες κωλύματος:", DAYS, default=[])
-    
-    # Χρήση select_slider για αποφυγή του TypeError
-    u_start, u_end = st.select_slider(
-        "Χρονικό διάστημα κωλύματος:",
-        options=HOURS,
-        value=(11, 16),
-        format_func=format_hour
-    )
+    STATUS_OPTS = ["🟢 Διαθέσιμος/η", "🔴 Όλη μέρα μη διαθέσιμος/η (Ρεπό)", "🟡 Κώλυμα συγκεκριμένες ώρες"]
+    status_to_code = {STATUS_OPTS[0]: "available", STATUS_OPTS[1]: "all_day", STATUS_OPTS[2]: "custom"}
+    code_to_status = {v: k for k, v in status_to_code.items()}
 
-    col_btn_add, col_btn_reset = st.columns([1, 1])
-    with col_btn_add:
-        if st.button("➕ Προσθήκη Κωλύματος για τις επιλεγμένες ημέρες"):
-            if not selected_days:
-                st.warning("Παρακαλώ επιλέξτε τουλάχιστον μία ημέρα.")
-            else:
-                for day in selected_days:
-                    if (day, u_start, u_end) not in emp["unavailability"]:
-                        emp["unavailability"].append((day, u_start, u_end))
-                st.success(f"Καταχωρήθηκαν {len(selected_days)} κωλύματα για: {format_hour(u_start)} - {format_hour(u_end)}!")
+    # Ανεξάρτητη ρύθμιση για κάθε ημέρα της εβδομάδας
+    for d in DAYS:
+        cur_day_data = emp["unavailability"][d]
+        cur_status = code_to_status.get(cur_day_data["status"], STATUS_OPTS[0])
+        
+        # Εμφάνιση badge κατάστασης στον τίτλο
+        if cur_day_data["status"] == "available":
+            badge = "🟢 Διαθέσιμος/η"
+        elif cur_day_data["status"] == "all_day":
+            badge = "🔴 Ρεπό (Όλη μέρα)"
+        else:
+            badge = f"🟡 Κώλυμα: {format_hour(cur_day_data['start'])} - {format_hour(cur_day_data['end'])}"
 
-    with col_btn_reset:
-        if st.button("🗑️ Καθαρισμός Όλων των Κωλυμάτων (Reset)"):
-            emp["unavailability"] = []
-            st.info("Όλα τα κωλύματά σας διαγράφηκαν.")
+        with st.expander(f"**{d}** — {badge}", expanded=(cur_day_data["status"] != "available")):
+            c_choice, c_slider = st.columns([1.5, 2.5])
+            
+            with c_choice:
+                selected_status = st.radio(
+                    f"Κατάσταση για {d}:",
+                    STATUS_OPTS,
+                    index=STATUS_OPTS.index(cur_status),
+                    key=f"status_{emp['id']}_{d}"
+                )
+                emp["unavailability"][d]["status"] = status_to_code[selected_status]
 
-    if emp["unavailability"]:
-        st.markdown("**Ενεργά κωλύματα:**")
-        unavail_data = [{"Ημέρα": d, "Από": format_hour(s), "Έως": format_hour(e)} for d, s, e in emp["unavailability"]]
-        st.table(pd.DataFrame(unavail_data))
-    else:
-        st.caption("Δεν υπάρχουν καταχωρημένα κωλύματα για τον συγκεκριμένο εργαζόμενο.")
+            with c_slider:
+                if selected_status == "🟡 Κώλυμα συγκεκριμένες ώρες":
+                    u_range = st.select_slider(
+                        f"Ώρες που ΔΕΝ μπορείτε ({d}):",
+                        options=HOURS,
+                        value=(cur_day_data.get("start", 11), cur_day_data.get("end", 17)),
+                        format_func=format_hour,
+                        key=f"slider_{emp['id']}_{d}"
+                    )
+                    emp["unavailability"][d]["start"] = u_range[0]
+                    emp["unavailability"][d]["end"] = u_range[1]
+                elif selected_status == "🔴 Όλη μέρα μη διαθέσιμος/η (Ρεπό)":
+                    st.info("Δεν θα σας ανατεθεί βάρδια αυτή την ημέρα.")
+                else:
+                    st.success("Πλήρως διαθέσιμος/η για εργασία.")
+
+    st.write("")
+    if st.button("🗑️ Καθαρισμός Όλων των Κωλυμάτων (Reset)"):
+        for d in DAYS:
+            emp["unavailability"][d] = {"status": "available", "start": 11, "end": 17}
+            st.session_state[f"status_{emp['id']}_{d}"] = STATUS_OPTS[0]
+            if f"slider_{emp['id']}_{d}" in st.session_state:
+                st.session_state[f"slider_{emp['id']}_{d}"] = (11, 17)
+        st.success(f"Όλα τα κωλύματα του/της {emp['name']} μηδενίστηκαν!")
+        st.rerun()
 
 # ---------------------------------------------------------
-# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER (CUSTOM ΖΩΝΕΣ & ΠΟΣΤΑ)
+# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER (CUSTOM ΖΩΝΕΣ)
 # ---------------------------------------------------------
 with tab2:
     st.subheader("Διαχείριση Ζωνών & Αναγκών Προσωπικού")
@@ -124,7 +157,7 @@ with tab2:
                 "Ελάχιστο Προσωπικό": z["min_staff"],
                 "Υποχρεωτικός Ναυτολογημένος": "Ναι" if z["require_marine"] else "Όχι"
             })
-        st.dataframe(pd.DataFrame(display_zones), use_container_width=True)
+        st.dataframe(pd.DataFrame(display_zones), use_container_width=True, hide_index=True)
 
     col_add, col_edit_del = st.columns(2)
 
@@ -195,10 +228,10 @@ with tab2:
                         st.rerun()
 
 # ---------------------------------------------------------
-# TAB 3: ΕΠΙΛΥΣΗ ΜΕ GOOGLE OR-TOOLS
+# TAB 3: ΕΠΙΛΥΣΗ ΚΑΙ EDITABLE ΤΕΛΙΚΟ ΠΡΟΓΡΑΜΜΑ
 # ---------------------------------------------------------
 with tab3:
-    st.subheader("Αυτόματη Δημιουργία Προγράμματος")
+    st.subheader("Αυτόματη Δημιουργία & Επεξεργασία Προγράμματος")
 
     if st.button("🚀 Υπολογισμός Προγράμματος (OR-Tools)"):
         model = cp_model.CpModel()
@@ -207,7 +240,7 @@ with tab3:
         x = {}
         for e in st.session_state.employees:
             for d in DAYS:
-                for h in range(11, 25):  # 14 ωριαίες θυρίδες (11:00 έως 01:00)
+                for h in range(11, 25):  # 11:00 έως 01:00
                     x[(e["id"], d, h)] = model.NewBoolVar(f"x_{e['id']}_{d}_{h}")
 
         # works_day[(emp_id, day)]: 1 αν κάνει μεροκάματο
@@ -222,13 +255,17 @@ with tab3:
             # Περιορισμός μέγιστων μεροκάματων
             model.Add(sum(works_day[(e["id"], d)] for d in DAYS) <= e["target_shifts"])
 
-            # Περιορισμός κωλυμάτων
-            for u_day, u_start, u_end in e["unavailability"]:
-                for h in range(u_start, u_end):
-                    if h in range(11, 25):
-                        model.Add(x[(e["id"], u_day, h)] == 0)
+            # Περιορισμοί Κωλυμάτων ανά Ημέρα
+            for d, u_info in e["unavailability"].items():
+                if u_info["status"] == "all_day":
+                    for h in range(11, 25):
+                        model.Add(x[(e["id"], d, h)] == 0)
+                elif u_info["status"] == "custom":
+                    for h in range(u_info["start"], u_info["end"]):
+                        if h in range(11, 25):
+                            model.Add(x[(e["id"], d, h)] == 0)
 
-            # Συνεχόμενο ωράριο (όχι σπαστά) & όρια βάρδιας (4 έως 8 ώρες)
+            # Συνεχόμενο ωράριο & όρια βάρδιας (4 έως 8 ώρες)
             for d in DAYS:
                 daily_h = [x[(e["id"], d, h)] for h in range(11, 25)]
                 model.Add(sum(daily_h) <= 8)
@@ -264,7 +301,7 @@ with tab3:
         status = solver.Solve(model)
 
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            st.success("🎉 Το πρόγραμμα υπολογίστηκε επιτυχώς χωρίς καμία παραβίαση κανόνα!")
+            st.success("🎉 Το πρόγραμμα υπολογίστηκε επιτυχώς!")
             
             results = []
             for d in DAYS:
@@ -278,18 +315,55 @@ with tab3:
                             "Εργαζόμενος": e["name"],
                             "Πόστο": e["role"],
                             "Ναυτολογημένος": "Ναι" if e["is_marine"] else "Όχι",
-                            "Ωράριο": f"{format_hour(start_h)} - {format_hour(end_h)}",
+                            "Έναρξη": format_hour(start_h),
+                            "Λήξη": format_hour(end_h),
                             "Σύνολο Ωρών": len(worked)
                         })
 
-            df_res = pd.DataFrame(results)
-            st.dataframe(df_res, use_container_width=True)
-
-            st.markdown("#### Αναλυτικό Πρόγραμμα ανά Ημέρα")
-            for d in DAYS:
-                day_df = df_res[df_res["Ημέρα"] == d]
-                if not day_df.empty:
-                    with st.expander(f"📅 {d} ({len(day_df)} άτομα)", expanded=True):
-                        st.table(day_df[["Εργαζόμενος", "Πόστο", "Ναυτολογημένος", "Ωράριο", "Σύνολο Ωρών"]])
+            st.session_state.schedule_df = pd.DataFrame(results)
         else:
-            st.error("❌ Αδύνατη η εύρεση λύσης! Οι απαιτήσεις προσωπικού υπερβαίνουν τα διαθέσιμα άτομα ή τα κωλύματα που δηλώθηκαν. Δοκιμάστε να μειώσετε τα ελάχιστα άτομα σε κάποιες ζώνες.")
+            st.error("❌ Αδύνατη η εύρεση λύσης! Ελέγξτε αν οι απαιτήσεις υπερβαίνουν τα διαθέσιμα άτομα ή τα κωλύματα που δηλώθηκαν.")
+
+    # ---------------------------------------------------------
+    # EDITABLE TABLE & LIVE PREVIEW
+    # ---------------------------------------------------------
+    if st.session_state.schedule_df is not None:
+        st.divider()
+        st.markdown("### ✏️ Ζωντανή Επεξεργασία Προγράμματος (Live Editor)")
+        st.info("💡 **Κάντε διπλό κλικ σε οποιοδήποτε κελί** για να αλλάξετε εργαζόμενο, πόστο ή ώρες. Μπορείτε επίσης να προσθέσετε γραμμές (`+`) ή να διαγράψετε.")
+
+        # Editable Data Table
+        time_options = [format_hour(h) for h in HOURS]
+        edited_df = st.data_editor(
+            st.session_state.schedule_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Ημέρα": st.column_config.SelectboxColumn("Ημέρα", options=DAYS, required=True),
+                "Εργαζόμενος": st.column_config.SelectboxColumn("Εργαζόμενος", options=STAFF_NAMES, required=True),
+                "Πόστο": st.column_config.SelectboxColumn("Πόστο", options=ROLES, required=True),
+                "Ναυτολογημένος": st.column_config.SelectboxColumn("Ναυτολογημένος", options=["Ναι", "Όχι"]),
+                "Έναρξη": st.column_config.SelectboxColumn("Έναρξη", options=time_options, required=True),
+                "Λήξη": st.column_config.SelectboxColumn("Λήξη", options=time_options, required=True),
+                "Σύνολο Ωρών": st.column_config.NumberColumn("Σύνολο Ωρών", min_value=1, max_value=14, step=1)
+            },
+            key="final_schedule_editor"
+        )
+        st.session_state.schedule_df = edited_df
+
+        # Κουμπί Λήψης CSV
+        csv_data = edited_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="📥 Λήψη Προγράμματος σε Excel / CSV",
+            data=csv_data,
+            file_name="programma_vardion.csv",
+            mime="text/csv"
+        )
+
+        # Καθημερινή προβολή βασισμένη στις αλλαγές του manager
+        st.markdown("#### 📅 Αναλυτική Προβολή ανά Ημέρα")
+        for d in DAYS:
+            day_df = edited_df[edited_df["Ημέρα"] == d]
+            if not day_df.empty:
+                with st.expander(f"📅 {d} ({len(day_df)} βάρδιες)", expanded=False):
+                    st.dataframe(day_df[["Εργαζόμενος", "Πόστο", "Ναυτολογημένος", "Έναρξη", "Λήξη", "Σύνολο Ωρών"]], use_container_width=True, hide_index=True)
