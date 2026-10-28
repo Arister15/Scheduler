@@ -87,13 +87,9 @@ def run_deep_diagnostics(employees, zones):
     results = {
         "shift_count_conflicts": [],
         "marine_issues": [],
-        "staff_shortages": [],
-        "min_shift_issues": [],
-        "max_hours_issues": [],
         "role_stats": {}
     }
 
-    # 1. Ντετερμινιστικός Έλεγχος Βαρδιών ανά Ημέρα & Ρόλο (Shift Span Check)
     for r in ROLES:
         staff_r = [e for e in employees if e["role"] == r]
         marines_r = [e for e in staff_r if e["is_marine"]]
@@ -104,8 +100,8 @@ def run_deep_diagnostics(employees, zones):
 
         for d in DAYS:
             daily_hours_needed = 0
-            closing_staff_needed = 0  # Άτομα που πρέπει να μείνουν μέχρι τη 01:00
-            opening_staff_needed = 0  # Άτομα που πρέπει να ανοίξουν στις 11:00
+            closing_staff_needed = 0
+            early_hours_sum = 0
             marine_hours_today = 0
 
             for h in range(11, 25):
@@ -113,8 +109,6 @@ def run_deep_diagnostics(employees, zones):
                 m_staff = max([z["min_staff"] for z in matching], default=0)
                 daily_hours_needed += m_staff
 
-                if h == 11:
-                    opening_staff_needed = m_staff
                 if h == 24:  # 00:00 - 01:00
                     closing_staff_needed = m_staff
                 if any(z["require_marine"] for z in matching):
@@ -122,17 +116,13 @@ def run_deep_diagnostics(employees, zones):
 
             total_hours_demanded += daily_hours_needed
 
-            # Υπολογισμός ελάχιστων ατόμων που πρέπει να δουλέψουν σήμερα:
-            # Όποιος κλείνει (μέχρι 01:00) μπορεί να ξεκινήσει το νωρίτερο στις 15:00 (10ωρο).
-            # Άρα όσα άτομα χρειάζονται πριν τις 15:00 δεν μπορούν να είναι τα ίδια με εκείνα που κλείνουν!
-            early_hours_sum = 0
             for h in range(11, 15):
                 matching = [z for z in zones if (z["day"] == "Όλες" or z["day"] == d) and z["role"] == r and z["start"] <= h < z["end"]]
                 early_hours_sum = max(early_hours_sum, max([z["min_staff"] for z in matching], default=0))
 
             min_shifts_today = max(
-                math.ceil(daily_hours_needed / 10.0),  # Κανένας δεν δουλεύει πάνω από 10 ώρες
-                closing_staff_needed + early_hours_sum # Οι πρωινοί + οι κλείνοντες
+                math.ceil(daily_hours_needed / 10.0),
+                closing_staff_needed + early_hours_sum
             )
             min_shifts_needed_week += min_shifts_today
 
@@ -183,6 +173,21 @@ with tab1:
     selected_name = st.selectbox("Επιλέξτε το όνομά σας:", emp_names, key="selected_employee_dropdown")
     emp = next(e for e in st.session_state.employees if e["name"] == selected_name)
 
+    # 1. ΣΥΝΤΟΜΗ ΕΙΚΟΝΑ ΔΙΑΘΕΣΙΜΟΤΗΤΑΣ ΕΠΑΝΩ
+    st.markdown("#### ⚡ Σύντομη Επισκόπηση Εβδομάδας")
+    quick_summary_dict = {}
+    for d in DAYS:
+        u_info = emp["unavailability"][d]
+        if u_info["status"] == "all_day":
+            quick_summary_dict[d] = "🔴 Ρεπό"
+        elif u_info["status"] == "custom":
+            quick_summary_dict[d] = f"🟡 {format_hour(u_info['start'])}-{format_hour(u_info['end'])}"
+        else:
+            quick_summary_dict[d] = "🟢 Διαθέσιμος"
+    
+    st.dataframe(pd.DataFrame([quick_summary_dict]), use_container_width=True, hide_index=True)
+
+    # 2. ΒΑΣΙΚΑ ΣΤΟΙΧΕΙΑ ΠΡΟΦΙΛ
     col_role, col_marine, col_shifts = st.columns(3)
     with col_role:
         new_role = st.selectbox("Πόστο εργασίας:", ROLES, index=ROLES.index(emp["role"]), key=f"ui_role_{emp['id']}")
@@ -192,7 +197,7 @@ with tab1:
         new_shifts = st.slider("Επιθυμητά μεροκάματα εβδομάδας:", 1, 7, value=emp["target_shifts"], key=f"ui_shifts_{emp['id']}", help="Ανάθεση: [στόχος - 1] έως [στόχος] ημέρες.")
 
     st.divider()
-    st.markdown("### 📅 Πρόγραμμα Διαθεσιμότητας ανά Ημέρα")
+    st.markdown("### 📅 Αναλυτική Ρύθμιση ανά Ημέρα")
 
     STATUS_OPTS = ["🟢 Διαθέσιμος/η", "🔴 Όλη μέρα ρεπό", "🟡 Κώλυμα συγκεκριμένες ώρες"]
     status_to_code = {STATUS_OPTS[0]: "available", STATUS_OPTS[1]: "all_day", STATUS_OPTS[2]: "custom"}
@@ -242,6 +247,7 @@ with tab1:
 
             save_persistent_data(st.session_state.employees, st.session_state.zones)
             st.success(f"🎉 Όλα τα στοιχεία για τον/την **{emp['name']}** αποθηκεύτηκαν μόνιμα!")
+            st.rerun()
 
     with col_reset:
         if st.button("🗑️ Καθαρισμός Κωλυμάτων (Reset)", use_container_width=True):
@@ -257,11 +263,11 @@ with tab1:
             st.rerun()
 
 # ---------------------------------------------------------
-# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER
+# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER (ΠΡΟΣΘΗΚΗ ΜΕ MULTIPLE DAYS & ΔΙΑΓΡΑΦΗ)
 # ---------------------------------------------------------
 with tab2:
     st.subheader("Διαχείριση Ζωνών & Αναγκών Προσωπικού")
-    st.info("💡 **Κάντε διπλό κλικ σε οποιοδήποτε κελί** του πίνακα για άμεση αλλαγή.")
+    st.caption("Επεξεργαστείτε τις ζώνες στον πίνακα ή χρησιμοποιήστε τα εργαλεία προσθήκης και διαγραφής παρακάτω.")
 
     zones_list_data = [
         {
@@ -294,6 +300,7 @@ with tab2:
         key="zones_table_editor"
     )
 
+    # Συγχρονισμός inline αλλαγών πίνακα
     updated_zones = []
     for idx, row in edited_zones_df.iterrows():
         s_val = parse_hour(str(row["Έναρξη"]))
@@ -315,30 +322,70 @@ with tab2:
         save_persistent_data(st.session_state.employees, st.session_state.zones)
 
     st.write("")
-    with st.expander("➕ Προσθήκη Νέας Ζώνης", expanded=False):
-        with st.form("add_zone_form"):
-            new_day = st.selectbox("Ημέρα:", ["Όλες"] + DAYS)
-            new_z_role = st.selectbox("Πόστο:", ROLES)
-            new_start, new_end = st.select_slider("Ωράριο Ζώνης:", options=HOURS, value=(18, 25), format_func=format_hour)
-            new_min_staff = st.number_input("Ελάχιστα απαιτούμενα άτομα:", min_value=1, max_value=10, value=2)
-            new_require_marine = st.checkbox("Απαιτείται τουλάχιστον 1 ναυτολογημένος")
-            
-            if st.form_submit_button("Αποθήκευση Νέας Ζώνης"):
-                new_id = max([z["id"] for z in st.session_state.zones], default=0) + 1
-                st.session_state.zones.append({
-                    "id": new_id,
-                    "day": new_day,
-                    "role": new_z_role,
-                    "start": new_start,
-                    "end": new_end,
-                    "min_staff": new_min_staff,
-                    "require_marine": new_require_marine
-                })
-                save_persistent_data(st.session_state.employees, st.session_state.zones)
-                if "zones_table_editor" in st.session_state:
-                    del st.session_state["zones_table_editor"]
-                st.success("Η ζώνη προστέθηκε και αποθηκεύτηκε επιτυχώς!")
-                st.rerun()
+    col_add, col_del = st.columns(2)
+
+    # 1. ΠΡΟΣΘΗΚΗ ΜΕ ΠΟΛΛΑΠΛΕΣ ΗΜΕΡΕΣ
+    with col_add:
+        with st.expander("➕ Προσθήκη Νέας Ζώνης (Πολλαπλές Ημέρες)", expanded=False):
+            with st.form("add_zone_form"):
+                chosen_days = st.multiselect(
+                    "Ημέρες εφαρμογής (Επιλέξτε 'Όλες' ή συγκεκριμένες ημέρες):",
+                    options=["Όλες"] + DAYS,
+                    default=["Όλες"]
+                )
+                new_z_role = st.selectbox("Πόστο:", ROLES)
+                new_start, new_end = st.select_slider("Ωράριο Ζώνης:", options=HOURS, value=(18, 25), format_func=format_hour)
+                new_min_staff = st.number_input("Ελάχιστα απαιτούμενα άτομα:", min_value=1, max_value=10, value=2)
+                new_require_marine = st.checkbox("Απαιτείται τουλάχιστον 1 ναυτολογημένος")
+                
+                if st.form_submit_button("Αποθήκευση Νέας Ζώνης"):
+                    if not chosen_days:
+                        st.error("Παρακαλώ επιλέξτε τουλάχιστον μία ημέρα ή 'Όλες'.")
+                    else:
+                        max_id = max([z["id"] for z in st.session_state.zones], default=0)
+                        days_to_apply = ["Όλες"] if "Όλες" in chosen_days else chosen_days
+
+                        for d in days_to_apply:
+                            max_id += 1
+                            st.session_state.zones.append({
+                                "id": max_id,
+                                "day": d,
+                                "role": new_z_role,
+                                "start": new_start,
+                                "end": new_end,
+                                "min_staff": new_min_staff,
+                                "require_marine": new_require_marine
+                            })
+
+                        save_persistent_data(st.session_state.employees, st.session_state.zones)
+                        if "zones_table_editor" in st.session_state:
+                            del st.session_state["zones_table_editor"]
+                        st.success(f"Προστέθηκαν επιτυχώς {len(days_to_apply)} ζώνες!")
+                        st.rerun()
+
+    # 2. ΕΙΔΙΚΟ ΕΡΓΑΛΕΙΟ ΔΙΑΓΡΑΦΗΣ ΖΩΝΗΣ
+    with col_del:
+        with st.expander("🗑️ Άμεση Διαγραφή Ζώνης", expanded=False):
+            if st.session_state.zones:
+                zone_options_map = {
+                    z["id"]: f"ID {z['id']} | {z['day']} | {z['role']} | {format_hour(z['start'])}-{format_hour(z['end'])} ({z['min_staff']} άτομα)"
+                    for z in st.session_state.zones
+                }
+                zone_to_delete = st.selectbox(
+                    "Επιλέξτε τη ζώνη που θέλετε να διαγράψετε:",
+                    options=list(zone_options_map.keys()),
+                    format_func=lambda x: zone_options_map[x]
+                )
+                
+                if st.button("❌ Οριστική Διαγραφή Ζώνης", type="secondary"):
+                    st.session_state.zones = [z for z in st.session_state.zones if z["id"] != zone_to_delete]
+                    save_persistent_data(st.session_state.employees, st.session_state.zones)
+                    if "zones_table_editor" in st.session_state:
+                        del st.session_state["zones_table_editor"]
+                    st.success("Η ζώνη διαγράφηκε επιτυχώς!")
+                    st.rerun()
+            else:
+                st.info("Δεν υπάρχουν καταχωρημένες ζώνες προς διαγραφή.")
 
 # ---------------------------------------------------------
 # TAB 3: ΕΠΙΛΥΣΗ ΜΕ ΑΠΟΛΥΤΗ ΔΙΑΓΝΩΣΗ
@@ -443,25 +490,22 @@ with tab3:
 
             diag = run_deep_diagnostics(st.session_state.employees, st.session_state.zones)
 
-            # 1. ΠΡΟΒΟΛΗ ΣΥΓΚΡΟΥΣΗΣ ΜΕΡΟΚΑΜΑΤΩΝ (Η ΒΑΣΙΚΗ ΑΙΤΙΑ)
             if diag["shift_count_conflicts"]:
                 st.error("### 🚨 1. Έλλειψη Διαθέσιμων Μεροκάματων (ΕΔΩ ΧΤΥΠΑΕΙ!)")
                 for conf in diag["shift_count_conflicts"]:
                     st.markdown(f"#### Πόστο: **{conf['role']}**")
                     st.write(
-                        f"• **Απαιτούμενες Βάρδιες Εβδομάδας:** `{conf['needed']} βάρδιες` (χρειάζονται τουλάχιστον 3 άτομα κάθε μέρα για να καλυφθεί το 11:00-01:00 με όριο 10ωρου).\n\n"
-                        f"• **Διαθέσιμες Βάρδιες Προσωπικού:** `{conf['available']} βάρδιες` (τα {conf['staff_count']} άτομα προσφέρουν συνολικά {conf['available']} μεροκάματα).\n\n"
+                        f"• **Απαιτούμενες Βάρδιες Εβδομάδας:** `{conf['needed']} βάρδιες`\n\n"
+                        f"• **Διαθέσιμες Βάρδιες Προσωπικού:** `{conf['available']} βάρδιες`\n\n"
                         f"👉 **Λείπουν ακριβώς `{conf['deficit']}` μεροκάματα!**"
                     )
                     st.info(f"💡 **Άμεση λύση:** Αυξήστε τα επιθυμητά μεροκάματα ενός ή δύο υπαλλήλων στο {conf['role']} (π.χ. από 5 σε 6), ή προσθέστε ένα άτομο στο πόστο.")
 
-            # 2. ΠΡΟΒΟΛΗ ΝΑΥΤΟΛΟΓΗΜΕΝΩΝ
             if diag["marine_issues"]:
                 st.warning("### ⚓ 2. Έλλειψη Ναυτολογημένων Βαρδιών")
                 for m in diag["marine_issues"]:
                     st.write(f"Στο πόστο **{m['role']}** απαιτούνται **{m['needed']}** ναυτολογημένες βάρδιες, αλλά οι ναυτολογημένοι καλύπτουν μόνο **{m['available']}**.")
 
-            # 3. ΠΙΝΑΚΑΣ
             st.markdown("### 📊 Συγκεντρωτικός Πίνακας Ανάλυσης")
             stats_table = []
             for r, s in diag["role_stats"].items():
