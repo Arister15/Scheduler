@@ -108,7 +108,7 @@ def build_default_employees():
     ]
 
 # ---------------------------------------------------------  
-# ΜΟΝΙΜΗ ΑΠΟΘΗΚΕΥΣΗ (JSON)  
+# ΜΟΝΙΜΗ ΑΠΟΘΗΚΕΥΣΗ (JSON) - ZERO DATA LOSS  
 # ---------------------------------------------------------  
 def sanitize_for_json(obj):
     if isinstance(obj, dict):
@@ -124,37 +124,57 @@ def load_persistent_data():
         try:  
             with open(DATA_FILE, "r", encoding="utf-8") as f:  
                 data = json.load(f)  
-                if "employees" in data:  
+                if "employees" in data and len(data["employees"]) >= 12:  
                     emps = data["employees"]
-                    # Εξασφάλιση ότι περιλαμβάνονται όλοι οι υπάλληλοι
-                    emp_names = [e.get("name") for e in emps]
-                    if "Kaba" in emp_names and len(emps) >= 12:
-                        raw_mat = data.get("matrix") or data.get("base_matrix") or data.get("active_matrix") or get_initial_zones_matrix()
-                        return emps, sort_matrix(raw_mat)
+                    matrix = data.get("matrix") or data.get("zones_matrix") or get_initial_zones_matrix()
+                    last_sched = data.get("last_schedule", None)
+                    last_raw = data.get("last_shifts_raw", [])
+                    violations = data.get("last_violations", [])
+                    return emps, sort_matrix(matrix), last_sched, last_raw, violations
         except Exception:  
             pass  
   
     default_employees = build_default_employees()  
     matrix = get_initial_zones_matrix()  
-    save_persistent_data(default_employees, matrix)  
-    return default_employees, matrix  
+    save_persistent_data(default_employees, matrix, None, [], [])  
+    return default_employees, matrix, None, [], []  
   
-def save_persistent_data(employees, matrix):  
+def save_persistent_data(employees, matrix, last_schedule=None, last_shifts_raw=None, violations=None):  
+    sched_records = None
+    if last_schedule is not None:
+        if isinstance(last_schedule, pd.DataFrame):
+            sched_records = last_schedule.to_dict('records')
+        else:
+            sched_records = last_schedule
+            
     data = {  
         "employees": sanitize_for_json(employees),  
-        "matrix": sanitize_for_json(sort_matrix(matrix))  
+        "matrix": sanitize_for_json(sort_matrix(matrix)),
+        "last_schedule": sanitize_for_json(sched_records),
+        "last_shifts_raw": sanitize_for_json(last_shifts_raw if last_shifts_raw is not None else []),
+        "last_violations": sanitize_for_json(violations if violations is not None else [])
     }  
     with open(DATA_FILE, "w", encoding="utf-8") as f:  
         json.dump(data, f, ensure_ascii=False, indent=2)  
-  
-if "employees" not in st.session_state or "zones_matrix" not in st.session_state:  
-    loaded_emps, loaded_matrix = load_persistent_data()  
+
+def persist_current_state():
+    """Αποθηκεύει αυτόματα όλη την τρέχουσα κατάσταση της εφαρμογής στον δίσκο."""
+    save_persistent_data(
+        st.session_state.employees,
+        st.session_state.zones_matrix,
+        st.session_state.matrix_schedule,
+        st.session_state.get("last_shifts_raw", []),
+        st.session_state.get("violations", [])
+    )
+
+if "employees" not in st.session_state:  
+    loaded_emps, loaded_matrix, loaded_sched, loaded_raw, loaded_viol = load_persistent_data()  
     st.session_state.employees = loaded_emps  
     st.session_state.zones_matrix = loaded_matrix  
-  
-if "matrix_schedule" not in st.session_state:  
-    st.session_state.matrix_schedule = None  
-  
+    st.session_state.matrix_schedule = pd.DataFrame(loaded_sched) if loaded_sched else None  
+    st.session_state.last_shifts_raw = loaded_raw  
+    st.session_state.violations = loaded_viol  
+
 # ---------------------------------------------------------  
 # KPIs  
 # ---------------------------------------------------------  
@@ -240,13 +260,23 @@ def matrix_to_requirements(matrix):
     return reqs  
 
 # ---------------------------------------------------------  
-# ΕΝΙΑΙΟΣ SOLVER (OR-TOOLS CP-SAT)  
+# ΕΝΙΑΙΟΣ SOLVER (OR-TOOLS) ΜΕ SOFT CONSTRAINTS / FALLBACK  
 # ---------------------------------------------------------  
-def solve_full_schedule(employees, all_reqs, relax=None):  
+def solve_full_schedule(employees, all_reqs, soft=False):  
     model = cp_model.CpModel()  
     
     x = {}  
     works_day = {}  
+    
+    # Slack μεταβλητές για καταγραφή παραβιάσεων όταν soft=True
+    slack_repo = {}
+    slack_custom = {}
+    slack_min_h = {}
+    slack_mar_days_under = {}
+    slack_mar_days_over = {}
+    slack_mar_hours = {}
+    slack_nonmar_under = {}
+    slack_nonmar_over = {}
     
     for e in employees:  
         eid = e["id"]  
@@ -265,8 +295,12 @@ def solve_full_schedule(employees, all_reqs, relax=None):
             model.Add(sum(daily_hours) <= 10)  
             
             # Ελάχιστο 4 ώρες συνεχόμενης βάρδιας  
-            if relax != "no_min_hours":  
+            if not soft:
                 model.Add(sum(daily_hours) >= 4).OnlyEnforceIf(works_day[(eid, d)])  
+            else:
+                sm = model.NewIntVar(0, 4, f"slack_minh_{eid}_{d}")
+                slack_min_h[(eid, d)] = sm
+                model.Add(sum(daily_hours) + sm >= 4).OnlyEnforceIf(works_day[(eid, d)])
                 
             # Συνεχόμενο ωράριο (όχι σπαστό)  
             starts = []  
@@ -280,40 +314,61 @@ def solve_full_schedule(employees, all_reqs, relax=None):
             model.Add(sum(starts) <= 1)  
             
         # Διαθεσιμότητα / Κωλύματα  
-        if relax not in ("no_unavail", "compound_all"):  
-            for d, u in e["unavailability"].items():  
-                if u["status"] == "all_day":  
+        for d, u in e["unavailability"].items():  
+            if u["status"] == "all_day":  
+                if not soft:
                     model.Add(works_day[(eid, d)] == 0)  
                     for h in range(11, 25):  
                         model.Add(x[(eid, d, h)] == 0)  
-                elif u["status"] == "custom":  
-                    for h in range(u["start"], u["end"]):  
-                        if h in range(11, 25):  
+                else:
+                    sr = model.NewBoolVar(f"slack_repo_{eid}_{d}")
+                    slack_repo[(eid, d)] = sr
+                    model.Add(works_day[(eid, d)] <= sr)
+            elif u["status"] == "custom":  
+                for h in range(u["start"], u["end"]):  
+                    if h in range(11, 25):  
+                        if not soft:
                             model.Add(x[(eid, d, h)] == 0)  
+                        else:
+                            sc = model.NewBoolVar(f"slack_custom_{eid}_{d}_{h}")
+                            slack_custom[(eid, d, h)] = sc
+                            model.Add(x[(eid, d, h)] <= sc)
                             
         # Περιορισμοί Μεροκάματων & 40+ Ωρών
         total_weekly_hours = sum(x[(eid, d, h)] for d in DAYS for h in range(11, 25))
         
         if e["is_marine"] and e["role"] in ["Bar", "Service"]:  
-            # 1. Σίγουρα 5/7 μεροκάματα (εκτός αν δήλωσε πάνω από 2 ρεπό)
-            target_days = min(5, avail_count)  
-            if relax not in ("no_min_shifts", "compound_shifts"):  
+            if not soft:
+                target_days = min(5, avail_count)  
                 model.Add(sum(works_day[(eid, d)] for d in DAYS) == target_days)  
-            
-            # 2. Τουλάχιστον 40 ώρες την εβδομάδα
-            if relax not in ("no_marine_hours", "compound_all"):
                 min_weekly_h = 40 if avail_count >= 5 else (avail_count * 8)
                 model.Add(total_weekly_hours >= min_weekly_h)
+            else:
+                s_under = model.NewIntVar(0, 5, f"s_mar_u_{eid}")
+                s_over = model.NewIntVar(0, 2, f"s_mar_o_{eid}")
+                slack_mar_days_under[eid] = s_under
+                slack_mar_days_over[eid] = s_over
+                model.Add(sum(works_day[(eid, d)] for d in DAYS) + s_under - s_over == 5)
+                
+                s_h = model.NewIntVar(0, 40, f"s_mar_h_{eid}")
+                slack_mar_hours[eid] = s_h
+                model.Add(total_weekly_hours + s_h >= 40)
         else:  
-            # Μη ναυτολογημένοι  
             eff_max = min(e["target_shifts"], avail_count)  
             eff_min = max(0, min(e["target_shifts"] - 1, avail_count))  
-            if relax not in ("no_min_shifts", "compound_shifts"):  
+            if not soft:
                 model.Add(sum(works_day[(eid, d)] for d in DAYS) >= eff_min)  
-            if relax not in ("no_max_shifts", "compound_shifts"):  
                 model.Add(sum(works_day[(eid, d)] for d in DAYS) <= eff_max)  
+            else:
+                sn_u = model.NewIntVar(0, 7, f"sn_u_{eid}")
+                sn_o = model.NewIntVar(0, 7, f"sn_o_{eid}")
+                slack_nonmar_under[eid] = sn_u
+                slack_nonmar_over[eid] = sn_o
+                model.Add(sum(works_day[(eid, d)] for d in DAYS) + sn_u >= eff_min)
+                model.Add(sum(works_day[(eid, d)] for d in DAYS) - sn_o <= eff_max)
                 
     # Κάλυψη Αναγκών ανά Πόστο  
+    slack_demand = {}
     for r in ROLES:  
         staff_r = [e for e in employees if e["role"] == r]  
         reqs_r = [rq for rq in all_reqs if rq["role"] == r]  
@@ -325,32 +380,60 @@ def solve_full_schedule(employees, all_reqs, relax=None):
                     if rq["day"] == d and rq["start"] <= h < rq["end"]:  
                         needed_staff = max(needed_staff, rq["min_staff"])  
                 if needed_staff > 0:  
-                    model.Add(sum(x[(e["id"], d, h)] for e in staff_r) >= needed_staff)  
+                    if not soft:
+                        model.Add(sum(x[(e["id"], d, h)] for e in staff_r) >= needed_staff)  
+                    else:
+                        sd = model.NewIntVar(0, needed_staff, f"sd_{r}_{d}_{h}")
+                        slack_demand[(r, d, h)] = sd
+                        model.Add(sum(x[(e["id"], d, h)] for e in staff_r) + sd >= needed_staff)
                     
-    # Κανόνας Ναυτολογημένων: 2 άτομα σύνολο από Bar & Service (είτε 1-1, είτε 2-0, είτε 0-2)  
+    # Κανόνας Ναυτολογημένων: 2 άτομα σύνολο από Bar & Service  
     marines_bs = [e for e in employees if e["is_marine"] and e["role"] in ["Bar", "Service"]]  
+    slack_marine_presence = {}
     
-    if relax not in ("no_marine", "compound_all"):  
-        for d in DAYS:  
-            for h in range(11, 25):  
-                marine_required = False  
-                for rq in all_reqs:  
-                    if rq["role"] in ["Bar", "Service"] and rq["day"] == d and rq["start"] <= h < rq["end"]:  
-                        if rq["require_marine"]:  
-                            marine_required = True  
-                            break  
-                if marine_required:  
+    for d in DAYS:  
+        for h in range(11, 25):  
+            marine_required = False  
+            for rq in all_reqs:  
+                if rq["role"] in ["Bar", "Service"] and rq["day"] == d and rq["start"] <= h < rq["end"]:  
+                    if rq["require_marine"]:  
+                        marine_required = True  
+                        break  
+            if marine_required:  
+                if not soft:
                     model.Add(sum(x[(e["id"], d, h)] for e in marines_bs) >= 2)  
+                else:
+                    s_mp = model.NewIntVar(0, 2, f"s_mp_{d}_{h}")
+                    slack_marine_presence[(d, h)] = s_mp
+                    model.Add(sum(x[(e["id"], d, h)] for e in marines_bs) + s_mp >= 2)
                     
-    # Στόχος: Ελαχιστοποίηση υπερβολικών ωρών πάνω από τις αναγκαίες
+    # Στόχος: Ελαχιστοποίηση ωρών και ποινών παραβίασης
     total_hours = sum(x[(e["id"], d, h)] for e in employees for d in DAYS for h in range(11, 25))  
-    model.Minimize(total_hours)  
+    
+    if not soft:
+        model.Minimize(total_hours)  
+    else:
+        penalty = (
+            sum(v * 3000 for v in slack_demand.values()) +
+            sum(v * 1500 for v in slack_marine_presence.values()) +
+            sum(v * 800 for v in slack_repo.values()) +
+            sum(v * 200 for v in slack_custom.values()) +
+            sum(v * 600 for v in slack_mar_days_under.values()) +
+            sum(v * 600 for v in slack_mar_days_over.values()) +
+            sum(v * 100 for v in slack_mar_hours.values()) +
+            sum(v * 300 for v in slack_nonmar_under.values()) +
+            sum(v * 300 for v in slack_nonmar_over.values()) +
+            sum(v * 80 for v in slack_min_h.values())
+        )
+        model.Minimize(total_hours + penalty)
     
     solver = cp_model.CpSolver()  
     solver.parameters.max_time_in_seconds = 10.0  
     status = solver.Solve(model)  
     
     res = []  
+    violations = []
+    
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):  
         for d in DAYS:  
             for e in employees:  
@@ -366,34 +449,72 @@ def solve_full_schedule(employees, all_reqs, relax=None):
                         "start_h": min(w),  
                         "end_h": max(w) + 1  
                     })  
-    return status, res  
+                    
+        # Συλλογή Παραβιάσεων αν λύθηκε με soft constraints
+        if soft:
+            emp_map = {e["id"]: e for e in employees}
+            
+            # 1. Παραβίαση Ρεπό
+            for (eid, d), var in slack_repo.items():
+                if solver.Value(var) > 0:
+                    emp = emp_map[eid]
+                    violations.append(f"👤 **{emp['name']}** ({emp['role']}): Αναγκάστηκε να εργαστεί την **{d}** παρόλο που είχε δηλώσει **Ρεπό**.")
+            
+            # 2. Παραβίαση Κωλύματος
+            custom_by_emp_day = {}
+            for (eid, d, h), var in slack_custom.items():
+                if solver.Value(var) > 0:
+                    custom_by_emp_day.setdefault((eid, d), []).append(h)
+            for (eid, d), hrs in custom_by_emp_day.items():
+                emp = emp_map[eid]
+                violations.append(f"👤 **{emp['name']}** ({emp['role']}): Εργάστηκε την **{d}** ({format_hour(min(hrs))}-{format_hour(max(hrs)+1)}) εντός του δηλωμένου **κωλύματος**.")
+                
+            # 3. Παραβίαση 5 Μεροκάματων Ναυτολογημένων
+            for eid, var in slack_mar_days_under.items():
+                val = solver.Value(var)
+                if val > 0:
+                    emp = emp_map[eid]
+                    violations.append(f"⚓ **{emp['name']}** (Ναυτολογημένος {emp['role']}): Πήρε **{5 - val}** μεροκάματα αντί για **5**.")
+            for eid, var in slack_mar_days_over.items():
+                val = solver.Value(var)
+                if val > 0:
+                    emp = emp_map[eid]
+                    violations.append(f"⚓ **{emp['name']}** (Ναυτολογημένος {emp['role']}): Πήρε **{5 + val}** μεροκάματα αντί για **5**.")
+                    
+            # 4. Παραβίαση 40+ Ωρών Ναυτολογημένων
+            for eid, var in slack_mar_hours.items():
+                val = solver.Value(var)
+                if val > 0:
+                    emp = emp_map[eid]
+                    violations.append(f"⚓ **{emp['name']}** (Ναυτολογημένος {emp['role']}): Συμπλήρωσε **{40 - val}** ώρες αντί για τουλάχιστον **40**.")
+                    
+            # 5. Παραβίαση 2 Ναυτολογημένων ανά βάρδια
+            mar_pres_days = set()
+            for (d, h), var in slack_marine_presence.items():
+                if solver.Value(var) > 0:
+                    mar_pres_days.add(d)
+            for d in mar_pres_days:
+                violations.append(f"⚓ **Βάρδια Ναυτολόγησης ({d}):** Δεν υπήρχαν 2 διαθέσιμοι ναυτολογημένοι στο σύνολο Bar/Service.")
+                
+            # 6. Έλλειψη Προσωπικού
+            demand_shortages = set()
+            for (r, d, h), var in slack_demand.items():
+                if solver.Value(var) > 0:
+                    demand_shortages.add((r, d))
+            for (r, d) in demand_shortages:
+                violations.append(f"👥 **Έλλειψη Προσωπικού:** Στο πόστο **{r}** την **{d}** δεν καλύφθηκε πλήρως ο απαιτούμενος αριθμός ατόμων.")
+                
+    return status, res, violations
 
-def diagnose_schedule_failure(employees, all_reqs, status):  
-    reasons = []  
-    if status == cp_model.UNKNOWN:  
-        reasons.append("⏱️ **Timeout:** Ο solver χρειάστηκε περισσότερο χρόνο λόγω υπερβολικής πολυπλοκότητας.")  
-        return reasons  
-        
-    st_no_mar_hours, _ = solve_full_schedule(employees, all_reqs, relax="no_marine_hours")
-    if st_no_mar_hours in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        reasons.append("⏱️ **Κανόνας 40 Ωρών Ναυτολόγησης:** Οι διαθέσιμες ζώνες στο μαγαζί δεν επαρκούν ώστε κάθε ναυτολογημένος να συμπληρώσει τουλάχιστον 40 ώρες σε 5 μεροκάματα.")
-
-    st_no_mar, _ = solve_full_schedule(employees, all_reqs, relax="no_marine")  
-    if st_no_mar in (cp_model.OPTIMAL, cp_model.FEASIBLE):  
-        reasons.append("⚓ **Κανόνας 2 Ναυτολογημένων:** Δεν υπάρχουν ταυτόχρονα 2 διαθέσιμοι ναυτολογημένοι από Bar και Service για όλες τις απαιτούμενες ζώνες.")  
-        
-    st_no_unavail, _ = solve_full_schedule(employees, all_reqs, relax="no_unavail")  
-    if st_no_unavail in (cp_model.OPTIMAL, cp_model.FEASIBLE):  
-        reasons.append("🚫 **Σύγκρουση Κωλυμάτων/Ρεπό:** Τα δηλωμένα ρεπό των υπαλλήλων συμπίπτουν με ώρες αυξημένων αναγκών.")  
-        
-    st_no_min_sh, _ = solve_full_schedule(employees, all_reqs, relax="no_min_shifts")  
-    if st_no_min_sh in (cp_model.OPTIMAL, cp_model.FEASIBLE):  
-        reasons.append("📉 **Κανόνας 5/7 Μεροκάματων:** Υπάρχει σύγκρουση στο να πάρουν όλοι οι ναυτολογημένοι ακριβώς 5 μεροκάματα.")  
-        
-    if not reasons:  
-        reasons.append("⚠️ **Σύνθετη Σύγκρουση Περιορισμών:** Συνδυασμός ορίων διάρκειας βάρδιας (4-10 ώρες), συνεχόμενου ωραρίου και απαιτήσεων προσωπικού.")  
-        
-    return reasons  
+def solve_schedule_with_fallback(employees, all_reqs):
+    """Δοκιμάζει πρώτα αυστηρή επίλυση. Αν αποτύχει, βρίσκει αυτόματα λύση με soft relaxation."""
+    status, shifts, violations = solve_full_schedule(employees, all_reqs, soft=False)
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return status, shifts, []
+    
+    # Αυτόματη προσαρμογή / χαλάρωση κανόνων
+    status_soft, shifts_soft, violations_soft = solve_full_schedule(employees, all_reqs, soft=True)
+    return status_soft, shifts_soft, violations_soft
 
 # ---------------------------------------------------------  
 # EXCEL EXPORT  
@@ -497,7 +618,7 @@ with tab1:
                             "target_shifts": 5 if is_actual_marine else new_sh,  
                             "unavailability": {d: {"status": "available", "start": 11, "end": 17} for d in DAYS}  
                         })  
-                        save_persistent_data(st.session_state.employees, st.session_state.zones_matrix)  
+                        persist_current_state()
                         st.success(f"Ο/Η {new_name} προστέθηκε επιτυχώς!")  
                         st.rerun()  
   
@@ -507,14 +628,14 @@ with tab1:
                 del_name = st.selectbox("Επιλέξτε υπάλληλο προς διαγραφή:", [e["name"] for e in st.session_state.employees], key="del_emp_select")  
                 if st.button("❌ Οριστική Διαγραφή", type="secondary"):  
                     st.session_state.employees = [e for e in st.session_state.employees if e["name"] != del_name]  
-                    save_persistent_data(st.session_state.employees, st.session_state.zones_matrix)  
+                    persist_current_state()
                     st.success(f"Ο/Η {del_name} διαγράφηκε!")  
                     st.rerun()  
 
             st.write("")
             if st.button("🔄 Επαναφορά Προεπιλεγμένων Εργαζομένων (Reset All)", type="secondary"):
                 st.session_state.employees = build_default_employees()
-                save_persistent_data(st.session_state.employees, st.session_state.zones_matrix)  
+                persist_current_state()
                 st.success("Επανήλθαν οι 12 προεπιλεγμένοι εργαζόμενοι!")
                 st.rerun()
   
@@ -606,7 +727,7 @@ with tab1:
                 slider_val = st.session_state.get(f"ui_slider_{emp['id']}_{d}", (11, 17))  
                 emp["unavailability"][d] = {"status": code, "start": slider_val[0], "end": slider_val[1]}  
   
-            save_persistent_data(st.session_state.employees, st.session_state.zones_matrix)  
+            persist_current_state()
             st.success(f"🎉 Όλα τα στοιχεία για τον/την **{emp['name']}** αποθηκεύτηκαν μόνιμα!")  
             st.rerun()  
   
@@ -619,12 +740,12 @@ with tab1:
                 if f"ui_slider_{emp['id']}_{d}" in st.session_state:  
                     st.session_state[f"ui_slider_{emp['id']}_{d}"] = (11, 17)  
   
-            save_persistent_data(st.session_state.employees, st.session_state.zones_matrix)  
+            persist_current_state()
             st.info(f"Τα κωλύματα του/της {emp['name']} μηδενίστηκαν.")  
             st.rerun()  
   
 # ---------------------------------------------------------  
-# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER (ΕΝΙΑΙΟ ΤΑΜΠΛΟ ΖΩΝΩΝ)  
+# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER (ΜΟΝΟ ΤΑΜΠΛΟ ΖΩΝΩΝ)  
 # ---------------------------------------------------------  
 with tab2:  
     st.subheader("Διαχείριση Αναγκών & Ζωνών Προσωπικού")  
@@ -645,13 +766,13 @@ with tab2:
   
     st.divider()  
 
-    # 1. Προσθήκη & Διαγραφή Ζώνης
+    # Προσθήκη & Διαγραφή Ζώνης
     col_tools_add, col_tools_del = st.columns(2)
     with col_tools_add:
         with st.expander("➕ Προσθήκη Νέας Ζώνης", expanded=False):
             with st.form("add_zone_form"):
                 z_role = st.selectbox("Πόστο:", ROLES, key="nz_role")
-                z_slot = st.text_input("Ωράριο (π.χ. 11:00 - 18:00, 19:00 - 01:00):", value="18:00 - 01:00", key="nz_slot")
+                z_slot = st.text_input("Ωράριο (π.χ. 11:00 - 18:00, 18:00 - 01:00):", value="18:00 - 01:00", key="nz_slot")
                 z_marine = st.selectbox("⚓ Απαίτηση Ναυτολόγησης:", ["Όχι", "Όλες τις ημέρες", "Μόνο Παρ - Κυρ", "Μόνο Δευτ - Πεμ"], key="nz_marine")
                 z_default_count = st.number_input("Πλήθος ατόμων (όλες τις μέρες):", min_value=0, max_value=10, value=1, step=1)
                 
@@ -669,8 +790,8 @@ with tab2:
                         
                         st.session_state.zones_matrix.append(new_zone)
                         st.session_state.zones_matrix = sort_matrix(st.session_state.zones_matrix)
-                        save_persistent_data(st.session_state.employees, st.session_state.zones_matrix)
-                        st.success(f"Η ζώνη **{z_role} ({z_slot})** προστέθηκε και ταξινομήθηκε αυτόματα!")
+                        persist_current_state()
+                        st.success(f"Η ζώνη **{z_role} ({z_slot})** προστέθηκε και αποθηκεύτηκε!")
                         st.rerun()
 
     with col_tools_del:
@@ -682,24 +803,22 @@ with tab2:
                 
                 if st.button("❌ Διαγραφή Αυτής της Ζώνης", type="secondary"):
                     deleted_item = st.session_state.zones_matrix.pop(del_idx)
-                    save_persistent_data(st.session_state.employees, st.session_state.zones_matrix)
-                    st.success(f"Η ζώνη [{deleted_item['Πόστο']}] {deleted_item['Ωράριο']} διαγράφηκε επιτυχώς!")
+                    persist_current_state()
+                    st.success(f"Η ζώνη [{deleted_item['Πόστο']}] {deleted_item['Ωράριο']} διαγράφηκε!")
                     st.rerun()
 
-    # 2. Ενιαίος Πίνακας Ζωνών με Πλήρη Επεξεργασία Κάθε Κελιού
-    st.markdown("#### 📊 Ενιαίο Ταμπλό Ζωνών (Πλήρως Επεξεργάσιμο)")
-    st.caption("💡 Μπορείτε να κάνετε κλικ σε **οποιοδήποτε κελί** για άμεση επεξεργασία (Πόστο, Ωράριο, Ναυτολόγηση, άτομα ανά ημέρα). Όλες οι ζώνες παραμένουν πάντα ταξινομημένες ανά Πόστο.")
+    # Ενιαίος Πίνακας Ζωνών
+    st.markdown("#### 📊 Ταμπλό Ζωνών (Πλήρως Επεξεργάσιμο)")
+    st.caption("💡 Μπορείτε να κάνετε κλικ σε **οποιοδήποτε κελί** για άμεση αλλαγή (Πόστο, Ωράριο, Ναυτολόγηση, άτομα). Όλες οι αλλαγές αποθηκεύονται αυτόματα και μόνιμα.")
 
     marine_options = ["Όχι", "Όλες τις ημέρες", "Μόνο Παρ - Κυρ", "Μόνο Δευτ - Πεμ"]
-    
-    # Εξασφάλιση ταξινόμησης
     st.session_state.zones_matrix = sort_matrix(st.session_state.zones_matrix)
     df_zones = pd.DataFrame(st.session_state.zones_matrix)
 
     edited_zones_df = st.data_editor(
         df_zones,
         use_container_width=True,
-        num_rows="dynamic",  # Επιτρέπει απευθείας προσθήκη / διαγραφή γραμμών
+        num_rows="dynamic",
         column_config={
             "Πόστο": st.column_config.SelectboxColumn("Πόστο", options=ROLES, required=True),
             "Ωράριο": st.column_config.TextColumn("Ωράριο", required=True),
@@ -717,52 +836,9 @@ with tab2:
 
     if not edited_zones_df.equals(df_zones):
         updated_records = edited_zones_df.dropna(subset=["Πόστο", "Ωράριο"]).to_dict('records')
-        # Αυτόματη ταξινόμηση ανά πόστο
         st.session_state.zones_matrix = sort_matrix(updated_records)
-        save_persistent_data(st.session_state.employees, st.session_state.zones_matrix)
+        persist_current_state()
         st.rerun()
-
-    # 3. Οπτική Προεπισκόπηση Ζωνών
-    st.markdown("#### 🎨 Οπτική Προεπισκόπηση & Σήμανση Ναυτολόγησης")  
-    st.caption("🟦 Στις ζώνες με σήμανση ⚓ εξασφαλίζεται η παρουσία τουλάχιστον 2 ναυτολογημένων από Bar & Service.")  
-  
-    preview_rows = []  
-    for row in st.session_state.zones_matrix:  
-        p_row = {"Πόστο": row["Πόστο"], "Ωράριο": row["Ωράριο"]}  
-        mar_rule = row.get("⚓ Ναυτολόγηση", "Όχι")  
-        for d in DAYS:  
-            count = row.get(d, 0)  
-            is_mar = False  
-            if mar_rule == "Όλες τις ημέρες":  
-                is_mar = True  
-            elif mar_rule == "Μόνο Παρ - Κυρ" and d in ["Παρασκευή", "Σάββατο", "Κυριακή"]:  
-                is_mar = True  
-            elif mar_rule == "Μόνο Δευτ - Πεμ" and d in ["Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη"]:  
-                is_mar = True  
-  
-            p_row[d] = f"{count} ⚓" if (is_mar and count > 0) else f"{count}"  
-        preview_rows.append(p_row)  
-  
-    df_preview = pd.DataFrame(preview_rows)  
-  
-    def highlight_zones(row):  
-        role = row["Πόστο"]  
-        if role == "Bar":  
-            base_color = "background-color: #CFE2F3; color: black;"  
-        elif role == "Service":  
-            base_color = "background-color: #FCE5CD; color: black;"  
-        else:  
-            base_color = "background-color: #FFF2CC; color: black;"  
-  
-        styles = []  
-        for col_name, val in row.items():  
-            if "⚓" in str(val):  
-                styles.append("background-color: #A9CCE3; color: #003366; font-weight: bold; border: 1px solid #1B4F72;")  
-            else:  
-                styles.append(base_color)  
-        return styles  
-  
-    st.dataframe(df_preview.style.apply(highlight_zones, axis=1), use_container_width=True, hide_index=True)  
 
 # ---------------------------------------------------------  
 # TAB 3: ΕΠΙΛΥΣΗ, ΕΓΧΡΩΜΟ FORMAT & EXCEL EXPORT  
@@ -773,11 +849,9 @@ with tab3:
     if st.button("🚀 Υπολογισμός Προγράμματος (OR-Tools)", type="primary"):  
         active_reqs = matrix_to_requirements(st.session_state.zones_matrix)  
         
-        status, all_shifts = solve_full_schedule(st.session_state.employees, active_reqs)  
+        status, all_shifts, violations = solve_schedule_with_fallback(st.session_state.employees, active_reqs)  
   
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):  
-            st.success("🎉 Το πρόγραμμα υπολογίστηκε επιτυχώς! Όλοι οι ναυτολογημένοι έχουν 5/7 μεροκάματα και τουλάχιστον 40 ώρες.")  
-  
             shift_dict = {(item["day"], item["name"]): item["shift"] for item in all_shifts}  
             sorted_employees = sorted(  
                 st.session_state.employees,  
@@ -797,19 +871,34 @@ with tab3:
   
             st.session_state.matrix_schedule = pd.DataFrame(matrix_rows)  
             st.session_state.last_shifts_raw = all_shifts  
+            st.session_state.violations = violations  
+            persist_current_state()
+            
+            if violations:
+                st.warning("⚠️ **Το πρόγραμμα δημιουργήθηκε με αυτόματη προσαρμογή κανόνων!** Δείτε τις παραβιάσεις παρακάτω:")
+            else:
+                st.success("🎉 Το πρόγραμμα υπολογίστηκε άψογα με τήρηση όλων των κανόνων και των ναυτολογήσεων!")
+            st.rerun()
         else:  
-            st.session_state.matrix_schedule = None  
-            st.error("❌ Αδύνατη η εύρεση λύσης! Δείτε παρακάτω τους λόγους σύγκρουσης:")  
-            reasons = diagnose_schedule_failure(st.session_state.employees, active_reqs, status)  
-            for reason in reasons:  
-                st.markdown(f"* {reason}")  
+            st.error("❌ Αδύνατη η εύρεση λύσης ακόμη και με χαλάρωση κανόνων. Ελέγξτε αν υπάρχει διαθέσιμο προσωπικό.")  
   
     # ---------------------------------------------------------  
-    # EDITABLE MATRIX & AUDIT  
+    # DISPLAY SCHEDULE & VIOLATIONS (PERSISTENT)  
     # ---------------------------------------------------------  
     if st.session_state.matrix_schedule is not None:  
         st.divider()  
+        
+        # Εμφάνιση Παραβιάσεων (αν υπήρξαν)
+        if st.session_state.get("violations"):
+            with st.container():
+                st.markdown("### ⚠️ Παραβιάσεις Κανόνων που Έγιναν για να Βγει το Πρόγραμμα")
+                st.info("💡 Ο αλγόριθμος αναγκάστηκε να παρακάμψει τους παρακάτω κανόνες. Μπορείτε να κάνετε διπλό κλικ σε οποιοδήποτε κελί του πίνακα παρακάτω για να αλλάξετε τη βάρδια, να τη μεταφέρετε σε άλλον υπάλληλο ή να βάλετε ΡΕΠΟ.")
+                for v in st.session_state.violations:
+                    st.markdown(f"- {v}")
+                st.write("")
+        
         st.markdown("### ✏️ Επεξεργάσιμο Πρόγραμμα Βαρδιών")  
+        st.caption("💡 Μπορείτε να επεξεργαστείτε οποιοδήποτε κελί (π.χ. να αλλάξετε ωράριο ή να βάλετε `ΡΕΠΟ`). Οι αλλαγές σας αποθηκεύονται αυτόματα και δεν χάνονται.")  
   
         edited_matrix = st.data_editor(  
             st.session_state.matrix_schedule,  
@@ -828,10 +917,14 @@ with tab3:
             },  
             key="matrix_schedule_editor"  
         )  
-        st.session_state.matrix_schedule = edited_matrix  
+        
+        if not edited_matrix.equals(st.session_state.matrix_schedule):  
+            st.session_state.matrix_schedule = edited_matrix  
+            persist_current_state()
+            st.rerun()  
   
         # Audit Ναυτολογημένων: Έλεγχος 5/7 και 40+ Ωρών  
-        with st.expander("⚓ Έλεγχος Ναυτολογημένων (5/7 Ημέρες & 40+ Ώρες)", expanded=True):  
+        with st.expander("⚓ Έλεγχος Ναυτολογημένων (5/7 Ημέρες & 40+ Ώρες)", expanded=False):  
             raw_shifts = st.session_state.get("last_shifts_raw", [])  
             marines_list = [e for e in st.session_state.employees if e["is_marine"] and e["role"] in ["Bar", "Service"]]  
             
@@ -839,14 +932,14 @@ with tab3:
             for m in marines_list:  
                 m_shifts = [s for s in raw_shifts if s["name"] == m["name"]]  
                 shifts_count = len(m_shifts)  
-                tot_hours = sum(s["hours"] for s in m_shifts)  
+                tot_hours = sum(s.get("hours", 0) for s in m_shifts)  
                 
                 marine_stats.append({  
                     "Εργαζόμενος": f"{m['name']} ⚓",  
                     "Πόστο": m["role"],  
                     "Μεροκάματα (Στόχος: 5/7)": f"{shifts_count} / 7",  
                     "Συνολικές Ώρες": f"{tot_hours} ώρες",  
-                    "Κανόνας 40+ Ωρών": "✅ Πληρούται" if tot_hours >= 40 else "❌ Κάτω από 40",  
+                    "Κανόνας 40+ Ωρών": "✅ Πληρούται" if tot_hours >= 40 else f"⚠️ {tot_hours}/40 ώρες",  
                     "Κανόνας 5/7": "✅ 5 Μεροκάματα" if shifts_count == 5 else f"⚠️ {shifts_count} Μεροκάματα"  
                 })  
             st.dataframe(pd.DataFrame(marine_stats), use_container_width=True, hide_index=True)  
