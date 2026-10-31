@@ -180,6 +180,9 @@ if "employees" not in st.session_state:
     st.session_state.matrix_schedule = pd.DataFrame(loaded_sched) if loaded_sched else None  
     st.session_state.last_shifts_raw = loaded_raw  
 
+if "zones_editor_ver" not in st.session_state:
+    st.session_state.zones_editor_ver = 0
+
 # ---------------------------------------------------------  
 # KPIs ΑΝΑΓΚΩΝ & ΖΩΝΩΝ (ΣΕ ΩΡΕΣ)
 # ---------------------------------------------------------  
@@ -201,7 +204,6 @@ def calculate_role_kpis(matrix, employees):
   
         avail_shifts = sum(e["target_shifts"] for e in staff_r)  
         avail_mar_shifts = sum(e["target_shifts"] for e in marines_r)  
-        # Υπολογισμός διαθέσιμων ωρών (8 ώρες μέση τυπική βάρδια πλήρους απασχόλησης)
         avail_hours = avail_shifts * 8  
   
         if avail_hours < total_hours:  
@@ -289,7 +291,7 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
             model.Add(sum(daily_hours) <= 12).OnlyEnforceIf(is_overtime)
             model.Add(sum(daily_hours) >= 11).OnlyEnforceIf(is_overtime)
             
-            # Ελάχιστες ώρες: αυστηρά τουλάχιστον 5 ώρες, προτίμηση για >6 ώρες
+            # Ελάχιστες ώρες: τουλάχιστον 5 ώρες, προτίμηση για >6 ώρες
             is_5h = model.NewBoolVar(f"is_5h_{eid}_{d}")
             is_6h = model.NewBoolVar(f"is_6h_{eid}_{d}")
             all_5h_vars.append(is_5h)
@@ -381,7 +383,6 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
     penalty_5h = sum(all_5h_vars)
     penalty_6h = sum(all_6h_vars)
     
-    # Ποινή για 5h (επιλέγονται μόνο αν είναι αναγκαίο) και για 6h (προτιμώνται >6h)
     model.Minimize(total_hours * 10 + total_ot_penalty * 20 + penalty_5h * 300 + penalty_6h * 60)  
     
     solver = cp_model.CpSolver()  
@@ -476,8 +477,7 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
         staff_r = [e for e in employees if e["role"] == r]  
         reqs_r = [rq for rq in all_reqs if rq["role"] == r]  
         total_avail_shifts = sum(e["target_shifts"] for e in staff_r)  
-        total_avail_hours = total_avail_shifts * 10  # Μέγιστη χωρητικότητα ωρών
-        
+        total_avail_hours = total_avail_shifts * 10  
         total_needed_hours = sum((rq["end"] - rq["start"]) * rq["min_staff"] for rq in reqs_r)
             
         if total_avail_hours < total_needed_hours:  
@@ -567,6 +567,51 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
     return issues  
 
 # ---------------------------------------------------------  
+# ΕΦΑΡΜΟΓΗ ΑΛΛΑΓΩΝ ΑΠΟ DATA EDITOR  
+# ---------------------------------------------------------  
+def apply_editor_changes(matrix, changes):
+    mat = copy.deepcopy(matrix)
+    edited_rows = changes.get("edited_rows", {})
+    added_rows = changes.get("added_rows", [])
+    deleted_rows = changes.get("deleted_rows", [])
+    
+    # 1. Ενημέρωση επεξεργασμένων κελιών
+    for idx_raw, row_changes in edited_rows.items():
+        row_idx = int(idx_raw)
+        if 0 <= row_idx < len(mat):
+            for col_k, col_v in row_changes.items():
+                if col_k in DAYS:
+                    try:
+                        mat[row_idx][col_k] = int(col_v or 0)
+                    except (ValueError, TypeError):
+                        mat[row_idx][col_k] = 0
+                else:
+                    mat[row_idx][col_k] = col_v
+                    
+    # 2. Διαγραφή γραμμών (από το μεγαλύτερο index προς το μικρότερο)
+    if deleted_rows:
+        for idx_raw in sorted([int(i) for i in deleted_rows], reverse=True):
+            if 0 <= idx_raw < len(mat):
+                mat.pop(idx_raw)
+
+    # 3. Προσθήκη νέων γραμμών
+    if added_rows:
+        for new_row in added_rows:
+            clean_row = {
+                "Πόστο": new_row.get("Πόστο", "Bar"),
+                "Ωράριο": new_row.get("Ωράριο", "18:00 - 01:00"),
+                "⚓ Ναυτολόγηση": new_row.get("⚓ Ναυτολόγηση", "Όχι"),
+            }
+            for d in DAYS:
+                try:
+                    clean_row[d] = int(new_row.get(d, 0) or 0)
+                except (ValueError, TypeError):
+                    clean_row[d] = 0
+            mat.append(clean_row)
+
+    return mat
+
+# ---------------------------------------------------------  
 # EXCEL EXPORT  
 # ---------------------------------------------------------  
 def create_styled_excel(df):  
@@ -633,46 +678,6 @@ def create_styled_excel(df):
     wb.save(output)  
     output.seek(0)  
     return output  
-
-# ---------------------------------------------------------  
-# CALLBACK ΓΙΑ ΑΜΕΣΗ ΑΠΟΘΗΚΕΥΣΗ ΖΩΝΩΝ ΧΩΡΙΣ ΚΟΛΛΗΜΑΤΑ  
-# ---------------------------------------------------------  
-def on_zones_editor_change():
-    changes = st.session_state.get("master_zones_editor", {})
-    if not changes:
-        return
-    
-    edited_rows = changes.get("edited_rows", {})
-    added_rows = changes.get("added_rows", [])
-    deleted_rows = changes.get("deleted_rows", [])
-    
-    for idx_raw, row_changes in edited_rows.items():
-        row_idx = int(idx_raw)
-        if 0 <= row_idx < len(st.session_state.zones_matrix):
-            for col_k, col_v in row_changes.items():
-                if col_k in DAYS:
-                    st.session_state.zones_matrix[row_idx][col_k] = int(col_v or 0)
-                else:
-                    st.session_state.zones_matrix[row_idx][col_k] = col_v
-                    
-    if deleted_rows:
-        for idx_raw in sorted(deleted_rows, reverse=True):
-            row_idx = int(idx_raw)
-            if 0 <= row_idx < len(st.session_state.zones_matrix):
-                st.session_state.zones_matrix.pop(row_idx)
-                
-    if added_rows:
-        for new_row in added_rows:
-            clean_row = {
-                "Πόστο": new_row.get("Πόστο", "Bar"),
-                "Ωράριο": new_row.get("Ωράριο", "18:00 - 01:00"),
-                "⚓ Ναυτολόγηση": new_row.get("⚓ Ναυτολόγηση", "Όχι"),
-            }
-            for d in DAYS:
-                clean_row[d] = int(new_row.get(d, 0) or 0)
-            st.session_state.zones_matrix.append(clean_row)
-            
-    persist_current_state()
 
 tab1, tab2, tab3 = st.tabs(["👤 Καρτέλα Υπαλλήλου", "⚙️ Ρυθμίσεις Manager (Ζώνες & Έλεγχος)", "📅 Τελικό Πρόγραμμα"])  
 
@@ -988,6 +993,7 @@ with tab2:
                         st.session_state.zones_matrix.append(new_zone)  
                         st.session_state.zones_matrix = sort_matrix(st.session_state.zones_matrix)  
                         persist_current_state()  
+                        st.session_state.zones_editor_ver = st.session_state.get("zones_editor_ver", 0) + 1
                         st.success(f"Η ζώνη **{z_role} ({z_slot})** προστέθηκε και αποθηκεύτηκε!")  
                         st.rerun()  
 
@@ -1001,12 +1007,31 @@ with tab2:
                 if st.button("❌ Διαγραφή Αυτής της Ζώνης", type="secondary"):  
                     deleted_item = st.session_state.zones_matrix.pop(del_idx)  
                     persist_current_state()  
+                    st.session_state.zones_editor_ver = st.session_state.get("zones_editor_ver", 0) + 1
                     st.success(f"Η ζώνη [{deleted_item['Πόστο']}] {deleted_item['Ωράριο']} διαγράφηκε!")  
                     st.rerun()  
 
-    # 4. ΠΛΗΡΩΣ ΕΠΕΞΕΡΓΑΣΙΜΟ ΤΑΜΠΛΟ ΖΩΝΩΝ (ΜΕ CALLBACK ΓΙΑ ΑΜΕΣΗ ΑΠΟΘΗΚΕΥΣΗ)
-    st.markdown("#### 📊 Ταμπλό Ζωνών (Πλήρως Επεξεργάσιμο)")  
-    st.caption("💡 Κάντε κλικ σε **οποιοδήποτε κελί** για άμεση αλλαγή (Πόστο, Ωράριο, Ναυτολόγηση, άτομα). Κάθε αλλαγή αποθηκεύεται άμεσα.")  
+    # 4. ΠΛΗΡΩΣ ΕΠΕΞΕΡΓΑΣΙΜΟ ΤΑΜΠΛΟ ΖΩΝΩΝ ΜΕ ΚΟΥΜΠΙ SAVE
+    editor_ver = st.session_state.get("zones_editor_ver", 0)
+    editor_key = f"master_zones_editor_{editor_ver}"
+    changes = st.session_state.get(editor_key, {})
+    has_changes = bool(changes.get("edited_rows") or changes.get("added_rows") or changes.get("deleted_rows"))
+
+    col_title, col_save = st.columns([3, 1.2])
+    with col_title:
+        st.markdown("#### 📊 Ταμπλό Ζωνών (Πλήρως Επεξεργάσιμο)")  
+        st.caption("💡 Κάντε κλικ σε **οποιοδήποτε κελί** για αλλαγή (Πόστο, Ωράριο, Ναυτολόγηση, άτομα).")  
+
+    with col_save:
+        if has_changes:
+            st.write("")
+            if st.button("💾 Αποθήκευση Ζωνών", type="primary", use_container_width=True):
+                updated_matrix = apply_editor_changes(st.session_state.zones_matrix, changes)
+                st.session_state.zones_matrix = sort_matrix(updated_matrix)
+                persist_current_state()
+                st.session_state.zones_editor_ver = editor_ver + 1
+                st.success("🎉 Οι αλλαγές αποθηκεύτηκαν επιτυχώς!")
+                st.rerun()
 
     marine_options = ["Όχι", "Όλες τις ημέρες", "Μόνο Παρ - Κυρ", "Μόνο Δευτ - Πεμ"]  
     df_zones = pd.DataFrame(st.session_state.zones_matrix)  
@@ -1027,8 +1052,7 @@ with tab2:
             "Σάββατο": st.column_config.NumberColumn("Σάββατο", min_value=0, max_value=10, step=1, default=0, required=True),  
             "Κυριακή": st.column_config.NumberColumn("Κυριακή", min_value=0, max_value=10, step=1, default=0, required=True),  
         },  
-        key="master_zones_editor",
-        on_change=on_zones_editor_change
+        key=editor_key
     )  
 
 # ---------------------------------------------------------  
