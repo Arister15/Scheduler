@@ -266,17 +266,19 @@ def matrix_to_requirements(matrix):
     return reqs  
 
 # ---------------------------------------------------------  
-# ΕΝΙΑΙΟΣ SOLVER (OR-TOOLS CP-SAT)  
+# ΕΝΙΑΙΟΣ SOLVER (OR-TOOLS CP-SAT) ΜΕ ΚΑΝΟΝΑ 10ΩΡΟΥ (+2h ΜΙΑ ΦΟΡΑ)
 # ---------------------------------------------------------  
 def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):  
     model = cp_model.CpModel()  
     
     x = {}  
     works_day = {}  
+    all_overtime_vars = []
     
     for e in employees:  
         eid = e["id"]  
         avail_count = sum(1 for d in DAYS if e["unavailability"][d]["status"] != "all_day")  
+        emp_overtimes = []
         
         for d in DAYS:  
             works_day[(eid, d)] = model.NewBoolVar(f"w_{eid}_{d}")  
@@ -287,11 +289,22 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
             model.Add(sum(daily_hours) >= 1).OnlyEnforceIf(works_day[(eid, d)])  
             model.Add(sum(daily_hours) == 0).OnlyEnforceIf(works_day[(eid, d)].Not())  
             
-            model.Add(sum(daily_hours) <= 10)  
+            # --- ΚΑΝΟΝΑΣ 10ΩΡΟΥ & ΕΞΑΙΡΕΣΗ ΕΩΣ 12ΩΡΟ ΜΙΑ ΦΟΡΑ ΤΗΝ ΕΒΔΟΜΑΔΑ ---
+            is_overtime = model.NewBoolVar(f"ot_{eid}_{d}")
+            emp_overtimes.append(is_overtime)
+            all_overtime_vars.append(is_overtime)
             
+            # Κανονική μέρα: max 10 ώρες
+            model.Add(sum(daily_hours) <= 10).OnlyEnforceIf(is_overtime.Not())
+            # Μέρα υπερωρίας: max 12 ώρες (και τουλάχιστον 11)
+            model.Add(sum(daily_hours) <= 12).OnlyEnforceIf(is_overtime)
+            model.Add(sum(daily_hours) >= 11).OnlyEnforceIf(is_overtime)
+            
+            # Ελάχιστη βάρδια 4 ώρες συνεχόμενης εργασίας  
             if relax != "no_min_hours":  
                 model.Add(sum(daily_hours) >= 4).OnlyEnforceIf(works_day[(eid, d)])  
                 
+            # Συνεχόμενο ωράριο (όχι σπαστό)  
             starts = []  
             for i, h in enumerate(range(11, 25)):  
                 st_var = model.NewBoolVar(f"st_{eid}_{d}_{h}")  
@@ -302,6 +315,10 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
                 starts.append(st_var)  
             model.Add(sum(starts) <= 1)  
             
+        # Επιτρέπεται το πολύ 1 ημέρα με >10 ώρες (11-12 ώρες) ανά υπάλληλο ανά εβδομάδα
+        model.Add(sum(emp_overtimes) <= 1)
+            
+        # Διαθεσιμότητα / Κωλύματα
         if relax not in ("no_unavail", "compound_all"):  
             for d, u in e["unavailability"].items():  
                 if u["status"] == "all_day":  
@@ -335,6 +352,7 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
             if relax not in ("no_max_shifts", "compound_all"):  
                 model.Add(sum(works_day[(eid, d)] for d in DAYS) <= eff_max)  
                 
+    # Κάλυψη Αναγκών ανά Πόστο  
     for r in ROLES:  
         staff_r = [e for e in employees if e["role"] == r]  
         reqs_r = [rq for rq in all_reqs if rq["role"] == r]  
@@ -348,6 +366,7 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
                 if needed_staff > 0:  
                     model.Add(sum(x[(e["id"], d, h)] for e in staff_r) >= needed_staff)  
                     
+    # Κανόνας Ναυτολογημένων: 2 άτομα σύνολο από Bar & Service  
     marines_bs = [e for e in employees if e["is_marine"] and e["role"] in ["Bar", "Service"]]  
     
     if relax not in ("no_marine", "compound_all"):  
@@ -362,8 +381,10 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
                 if marine_required:  
                     model.Add(sum(x[(e["id"], d, h)] for e in marines_bs) >= 2)  
                     
+    # Στόχος: Ελαχιστοποίηση συνολικών ωρών με ελαφρά προτίμηση αποφυγής 11-12ωρου αν δεν είναι απαραίτητο
     total_hours = sum(x[(e["id"], d, h)] for e in employees for d in DAYS for h in range(11, 25))  
-    model.Minimize(total_hours)  
+    total_ot_penalty = sum(all_overtime_vars)
+    model.Minimize(total_hours * 10 + total_ot_penalty * 2)  
     
     solver = cp_model.CpSolver()  
     solver.parameters.max_time_in_seconds = time_limit  
@@ -382,6 +403,7 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
                         "is_marine": e["is_marine"],  
                         "shift": f"{format_hour(min(w))}-{format_hour(max(w) + 1)}",  
                         "hours": len(w),
+                        "is_overtime": len(w) > 10,
                         "start_h": min(w),  
                         "end_h": max(w) + 1  
                     })  
@@ -402,7 +424,6 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
         })
         return issues  
         
-    # 1. Έλεγχος διαθεσιμότητας ανά πόστο, ημέρα και ώρα
     for r in ROLES:  
         staff_r = [e for e in employees if e["role"] == r]  
         reqs_r = [rq for rq in all_reqs if rq["role"] == r]  
@@ -439,7 +460,6 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
                         })
                         break  
                         
-    # 2. Έλεγχος συνολικών μεροκάματων ανά πόστο  
     for r in ROLES:  
         staff_r = [e for e in employees if e["role"] == r]  
         reqs_r = [rq for rq in all_reqs if rq["role"] == r]  
@@ -466,7 +486,6 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
                 "Ακριβής Αιτία & Λεπτομέρειες": f"Το πόστο απαιτεί τουλάχιστον {min_shifts_needed} βάρδιες/εβδομάδα, αλλά το προσωπικό προσφέρει συνολικά μόνο {total_avail_shifts} μεροκάματα. Αυξήστε τα επιθυμητά μεροκάματα κάποιου εργαζομένου ή προσθέστε άτομο."
             })
             
-    # 3. Έλεγχος ναυτολογημένων Bar + Service ανά ημέρα & ώρα
     marines_bs = [e for e in employees if e["is_marine"] and e["role"] in ["Bar", "Service"]]  
     if len(marines_bs) < 2:  
         issues.append({
@@ -499,14 +518,13 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
                         })
                         break  
 
-    # 4. Συνδυαστικοί έλεγχοι αν δεν εντοπίστηκε απλή έλλειψη
     st_no_mar, _ = solve_full_schedule(employees, all_reqs, relax="no_marine", time_limit=1.5)  
     if st_no_mar in (cp_model.OPTIMAL, cp_model.FEASIBLE) and not any("⚓" in iss["Τύπος Προβλήματος"] for iss in issues):  
         issues.append({
             "Πόστο": "Bar & Service (Κοινό)",
             "Ημέρα": "Πολλαπλές Ημέρες",
-            "Τύπος Προβλήματος": "⚓ Σύγκρουση Ναυτολόγησης & 10ώρου",
-            "Ακριβής Αιτία & Λεπτομέρειες": "Οι ναυτολογημένοι δεν μπορούν να καλύψουν ταυτόχρονα όλες τις βάρδιες ναυτολόγησης (18:00-01:00) τηρώντας το μέγιστο 10ωρο, τη μη-σπαστή βάρδια και τα ρεπό τους."
+            "Τύπος Προβλήματος": "⚓ Σύγκρουση Ναυτολόγησης & Ωραρίου",
+            "Ακριβής Αιτία & Λεπτομέρειες": "Οι ναυτολογημένοι δεν επαρκούν για όλες τις βάρδιες ναυτολόγησης (18:00-01:00) τηρώντας το όριο των 10 ωρών (max 12h για 1 μέρα), τη μη-σπαστή βάρδια και τα ρεπό τους."
         })
             
     st_no_mar_hours, _ = solve_full_schedule(employees, all_reqs, relax="no_marine_hours", time_limit=1.5)  
@@ -515,7 +533,7 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
             "Πόστο": "Bar & Service",
             "Ημέρα": "Όλη την εβδομάδα",
             "Τύπος Προβλήματος": "⏱️ Κανόνας 40 Ωρών Ναυτολόγησης",
-            "Ακριβής Αιτία & Λεπτομέρειες": "Οι διαθέσιμες ζώνες και ώρες δεν επαρκούν ώστε κάθε ναυτολογημένος να συμπληρώσει τουλάχιστον 40 ώρες (μέγιστο 10 ώρες/ημέρα)."
+            "Ακριβής Αιτία & Λεπτομέρειες": "Οι διαθέσιμες ζώνες και ώρες δεν επαρκούν ώστε κάθε ναυτολογημένος να συμπληρώσει τουλάχιστον 40 ώρες (μέγιστο 10 ώρες κανονικά, 12 ώρες για 1 μέρα)."
         })
 
     if not issues:  
@@ -523,7 +541,7 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
             "Πόστο": "Όλα τα Πόστα",
             "Ημέρα": "Εβδομαδιαίο",
             "Τύπος Προβλήματος": "⚠️ Σύνθετη Σύγκρουση Περιορισμών",
-            "Ακριβής Αιτία & Λεπτομέρειες": "Συνδυασμός ορίων διάρκειας βάρδιας (4-10 ώρες), συνεχόμενου ωραρίου (όχι σπαστό) και αλληλοεπικαλυπτόμενων αναγκών."
+            "Ακριβής Αιτία & Λεπτομέρειες": "Συνδυασμός ορίων διάρκειας βάρδιας (4-10 ώρες, max 12h για 1 μέρα), συνεχόμενου ωραρίου (όχι σπαστό) και αλληλοεπικαλυπτόμενων αναγκών."
         })
         
     return issues  
@@ -686,7 +704,7 @@ with tab1:
         if new_marine and new_role in ["Bar", "Service"]:  
             cur_val = max(5, emp.get("target_shifts", 5))  
             new_shifts = st.slider("Επιθυμητά μεροκάματα εβδομάδας (Ναυτολογημένος: min 5):", 5, 7, value=cur_val, key=f"ui_shifts_{emp['id']}")  
-            st.caption("⚓ Τουλάχιστον 5 μεροκάματα & 40+ ώρες (μπορείτε να επιλέξετε 5, 6 ή 7).")  
+            st.caption("⚓ Τουλάχιστον 5 μεροκάματα & 40+ ώρες (επιτρέπεται 1 ημέρα 11-12h).")  
         else:  
             new_shifts = st.slider("Επιθυμητά μεροκάματα εβδομάδας:", 1, 7, value=emp["target_shifts"], key=f"ui_shifts_{emp['id']}")  
   
@@ -769,7 +787,6 @@ with tab2:
     st.caption("🔍 Επισκόπηση διαθεσιμότητας προσωπικού σε σχέση με τις ανάγκες του μαγαζιού ανά ημέρα. Τα κόκκινα κελιά υποδεικνύουν άμεσο έλλειμμα.")
 
     dash_tabs = st.tabs(["🍸 Bar", "🍽️ Service", "🛎️ Υποδοχή"])
-    
     current_matrix = st.session_state.zones_matrix
     
     for idx, r in enumerate(ROLES):
@@ -777,7 +794,6 @@ with tab2:
             staff_r = [e for e in st.session_state.employees if e["role"] == r]
             role_rows = [row for row in current_matrix if row["Πόστο"] == r]
             
-            # Υπολογισμός απαιτούμενου peak προσωπικού ανά ημέρα
             daily_needed_peak = {}
             for d in DAYS:
                 h_dem = [0] * 26
@@ -807,7 +823,6 @@ with tab2:
                         row_dict[d] = "🟢 Διαθέσιμος"
                 dash_rows.append(row_dict)
 
-            # Γραμμή: Σύνολο Διαθέσιμων
             avail_row = {"Εργαζόμενος": "👥 Σύνολο Διαθέσιμων", "Μεροκάματα": f"{sum(e['target_shifts'] for e in staff_r)}"}
             for d in DAYS:
                 cnt = 0
@@ -817,13 +832,11 @@ with tab2:
                 avail_row[d] = f"{cnt} άτομα"
             dash_rows.append(avail_row)
 
-            # Γραμμή: Απαιτούμενο Προσωπικό (Peak)
             needed_row = {"Εργαζόμενος": "📌 Απαιτούμενο Προσωπικό (Αιχμή)", "Μεροκάματα": "-"}
             for d in DAYS:
                 needed_row[d] = f"{daily_needed_peak[d]} άτομα"
             dash_rows.append(needed_row)
 
-            # Γραμμή: Ισοζύγιο / Κάλυψη
             balance_row = {"Εργαζόμενος": "⚖️ Έλεγχος Κάλυψης", "Μεροκάματα": "-"}
             for d in DAYS:
                 avail_cnt = sum(1 for e in staff_r if e["unavailability"].get(d, {}).get("status") != "all_day")
@@ -837,7 +850,6 @@ with tab2:
                     balance_row[d] = f"🟢 Πλήρης (+{diff})"
             dash_rows.append(balance_row)
 
-            # Αν είναι Bar ή Service, προσθήκη γραμμής διαθέσιμων ναυτολογημένων
             if r in ["Bar", "Service"]:
                 mar_row = {"Εργαζόμενος": "⚓ Διαθέσιμοι Ναυτολογημένοι", "Μεροκάματα": "-"}
                 for d in DAYS:
@@ -949,7 +961,7 @@ with tab2:
                 )  
 
         if pre_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            st.success("🟢 **Πλήρης Ετοιμότητα Προγράμματος:** Το πρόγραμμα είναι 100% επιλύσιμο! Όλες οι βάρδιες, τα ρεπό και οι ναυτολογήσεις (2 άτομα, 5+ μεροκάματα, 40+ ώρες) καλύπτονται άψογα.")
+            st.success("🟢 **Πλήρης Ετοιμότητα Προγράμματος:** Το πρόγραμμα είναι 100% επιλύσιμο! Όλες οι βάρδιες, τα ρεπό, ο κανόνας 10ώρου (max 12h για 1 μέρα) και οι ναυτολογήσεις (2 άτομα, 5+ μεροκάματα, 40+ ώρες) καλύπτονται άψογα.")
         else:
             st.error(f"🔴 **ΠΡΟΕΙΔΟΠΟΙΗΣΗ: Το πρόγραμμα ΔΕΝ θα βγει! Εντοπίστηκαν {len(pre_issues)} σημεία εμπλοκής:**")
             df_issues = pd.DataFrame(pre_issues)
@@ -1042,8 +1054,8 @@ with tab3:
             persist_current_state()  
             st.rerun()  
 
-        # Audit Ναυτολογημένων: Έλεγχος 5+ Ημερών & 40+ Ωρών  
-        with st.expander("⚓ Έλεγχος Ναυτολογημένων (5+ Μεροκάματα & 40+ Ώρες)", expanded=True):  
+        # Audit Ναυτολογημένων: Έλεγχος 5+ Ημερών, 40+ Ωρών & 11-12ωρου  
+        with st.expander("⚓ Έλεγχος Ναυτολογημένων & Ωρών Εργασίας", expanded=True):  
             raw_shifts = st.session_state.get("last_shifts_raw", [])  
             marines_list = [e for e in st.session_state.employees if e["is_marine"] and e["role"] in ["Bar", "Service"]]  
             
@@ -1052,15 +1064,18 @@ with tab3:
                 m_shifts = [s for s in raw_shifts if s["name"] == m["name"]]  
                 shifts_count = len(m_shifts)  
                 tot_hours = sum(s.get("hours", 0) for s in m_shifts)  
+                overtime_shifts = [f"{s['day']} ({s['hours']}h)" for s in m_shifts if s.get("hours", 0) > 10]
+                ot_str = ", ".join(overtime_shifts) if overtime_shifts else "Καμία (≤10h)"
                 
                 marine_stats.append({  
                     "Εργαζόμενος": f"{m['name']} ⚓",  
                     "Πόστο": m["role"],  
                     "Επιθυμητά": f"{m['target_shifts']} μεροκάματα",  
-                    "Πραγματικά Μεροκάματα": f"{shifts_count} / 7",  
+                    "Πραγματικά": f"{shifts_count} / 7",  
                     "Συνολικές Ώρες": f"{tot_hours} ώρες",  
                     "Κανόνας 40+ Ωρών": "✅ Πληρούται" if tot_hours >= 40 else f"⚠️ {tot_hours}/40 ώρες",  
-                    "Κανόνας 5+ Μεροκάματα": "✅ Πληρούται" if shifts_count >= 5 else f"❌ {shifts_count} (<5)"  
+                    "Κανόνας 5+ Μεροκάματα": "✅ Πληρούται" if shifts_count >= 5 else f"❌ {shifts_count} (<5)",
+                    "Βάρδια >10ωρο (max 1 μέρα)": f"✅ {ot_str}" if len(overtime_shifts) <= 1 else f"❌ {len(overtime_shifts)} ημέρες"
                 })  
             st.dataframe(pd.DataFrame(marine_stats), use_container_width=True, hide_index=True)  
   
