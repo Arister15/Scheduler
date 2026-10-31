@@ -266,7 +266,8 @@ def matrix_to_requirements(matrix):
     return reqs  
 
 # ---------------------------------------------------------  
-# ΕΝΙΑΙΟΣ SOLVER (OR-TOOLS CP-SAT) ΜΕ ΚΑΝΟΝΑ 10ΩΡΟΥ (+2h ΜΙΑ ΦΟΡΑ)
+# ΕΝΙΑΙΟΣ SOLVER (OR-TOOLS CP-SAT)  
+# ΜΕ ΚΑΝΟΝΑ 10ΩΡΟΥ (+2h ΜΙΑ ΦΟΡΑ) & MIN 5 ΩΡΕΣ (ΙΔΑΝΙΚΑ >6 ΩΡΕΣ)
 # ---------------------------------------------------------  
 def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):  
     model = cp_model.CpModel()  
@@ -274,6 +275,8 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
     x = {}  
     works_day = {}  
     all_overtime_vars = []
+    all_5h_vars = []
+    all_6h_vars = []
     
     for e in employees:  
         eid = e["id"]  
@@ -300,9 +303,22 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
             model.Add(sum(daily_hours) <= 12).OnlyEnforceIf(is_overtime)
             model.Add(sum(daily_hours) >= 11).OnlyEnforceIf(is_overtime)
             
-            # Ελάχιστη βάρδια 4 ώρες συνεχόμενης εργασίας  
+            # --- ΕΛΑΧΙΣΤΕΣ ΩΡΕΣ: ΤΟΥΛΑΧΙΣΤΟΝ 5 ΩΡΕΣ, ΠΡΟΤΙΜΗΣΗ ΓΙΑ >6 ΩΡΕΣ ---
+            is_5h = model.NewBoolVar(f"is_5h_{eid}_{d}")
+            is_6h = model.NewBoolVar(f"is_6h_{eid}_{d}")
+            all_5h_vars.append(is_5h)
+            all_6h_vars.append(is_6h)
+            
+            model.Add(is_5h == 0).OnlyEnforceIf(works_day[(eid, d)].Not())
+            model.Add(is_6h == 0).OnlyEnforceIf(works_day[(eid, d)].Not())
+
             if relax != "no_min_hours":  
-                model.Add(sum(daily_hours) >= 4).OnlyEnforceIf(works_day[(eid, d)])  
+                # Αυστηρό όριο: κανείς κάτω από 5 ώρες εργασίας
+                model.Add(sum(daily_hours) >= 5).OnlyEnforceIf(works_day[(eid, d)])  
+                # Αν δεν είναι 5 ώρες, τουλάχιστον 6 ώρες
+                model.Add(sum(daily_hours) >= 6).OnlyEnforceIf([works_day[(eid, d)], is_5h.Not()])
+                # Ιδανικά πάνω από 6 ώρες (δηλαδή 7+ ώρες)
+                model.Add(sum(daily_hours) >= 7).OnlyEnforceIf([works_day[(eid, d)], is_5h.Not(), is_6h.Not()])
                 
             # Συνεχόμενο ωράριο (όχι σπαστό)  
             starts = []  
@@ -381,10 +397,14 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
                 if marine_required:  
                     model.Add(sum(x[(e["id"], d, h)] for e in marines_bs) >= 2)  
                     
-    # Στόχος: Ελαχιστοποίηση συνολικών ωρών με ελαφρά προτίμηση αποφυγής 11-12ωρου αν δεν είναι απαραίτητο
+    # Στόχος: Ελαχιστοποίηση συνολικών ωρών, αποφυγή υπερωρίας και ισχυρή ποινή για βάρδιες <= 6h (ιδιαίτερα 5h)
     total_hours = sum(x[(e["id"], d, h)] for e in employees for d in DAYS for h in range(11, 25))  
     total_ot_penalty = sum(all_overtime_vars)
-    model.Minimize(total_hours * 10 + total_ot_penalty * 2)  
+    penalty_5h = sum(all_5h_vars)
+    penalty_6h = sum(all_6h_vars)
+    
+    # 5 ώρες: ποινή 300 (επιλέγονται μόνο αν είναι απόλυτη ανάγκη), 6 ώρες: ποινή 60 (προτιμώνται >6 ώρες)
+    model.Minimize(total_hours * 10 + total_ot_penalty * 20 + penalty_5h * 300 + penalty_6h * 60)  
     
     solver = cp_model.CpSolver()  
     solver.parameters.max_time_in_seconds = time_limit  
@@ -410,7 +430,7 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
     return status, res  
 
 # ---------------------------------------------------------  
-# ΔΙΑΓΝΩΣΤΙΚΟ ΜΕ ΧΡΟΝΙΚΟ ΠΛΑΙΣΙΟ / ΒΑΡΔΙΑ (ΧΩΡΙΣ ΠΕΡΙΤΤΕΣ ΛΕΠΤΟΜΕΡΕΙΕΣ)
+# ΔΙΑΓΝΩΣΤΙΚΟ ΜΕ ΧΡΟΝΙΚΟ ΠΛΑΙΣΙΟ / ΒΑΡΔΙΑ  
 # ---------------------------------------------------------  
 def diagnose_schedule_failure(employees, all_reqs, status=None):  
     issues = []  
@@ -993,7 +1013,7 @@ with tab2:
                 )  
 
         if pre_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            st.success("🟢 **Πλήρης Ετοιμότητα Προγράμματος:** Το πρόγραμμα είναι 100% επιλύσιμο! Όλες οι βάρδιες, τα ρεπό, ο κανόνας 10ώρου (max 12h για 1 μέρα) και οι ναυτολογήσεις (2 άτομα, 5+ μεροκάματα, 40+ ώρες) καλύπτονται άψογα.")
+            st.success("🟢 **Πλήρης Ετοιμότητα Προγράμματος:** Το πρόγραμμα είναι 100% επιλύσιμο! Όλες οι βάρδιες, τα ρεπό, ο κανόνας 10ώρου (max 12h για 1 μέρα), η ελάχιστη βάρδια 5+ ωρών και οι ναυτολογήσεις (2 άτομα, 5+ μεροκάματα, 40+ ώρες) καλύπτονται άψογα.")
         else:
             st.error(f"🔴 **ΠΡΟΕΙΔΟΠΟΙΗΣΗ: Το πρόγραμμα ΔΕΝ θα βγει! Εντοπίστηκαν {len(pre_issues)} σημεία εμπλοκής:**")
             df_issues = pd.DataFrame(pre_issues)
