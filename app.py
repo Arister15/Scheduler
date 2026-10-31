@@ -181,7 +181,7 @@ if "employees" not in st.session_state:
     st.session_state.last_shifts_raw = loaded_raw  
 
 # ---------------------------------------------------------  
-# ΥΠΟΛΟΓΙΣΜΟΣ KPIs ΑΝΑΓΚΩΝ  
+# KPIs ΑΝΑΓΚΩΝ & ΖΩΝΩΝ  
 # ---------------------------------------------------------  
 def calculate_role_kpis(matrix, employees):  
     kpis = {}  
@@ -206,7 +206,6 @@ def calculate_role_kpis(matrix, employees):
                         hourly_demand[h] += needed
 
             total_hours += daily_hours  
-            
             morning_peak = max(hourly_demand[11:18]) if any(hourly_demand[11:18]) else 0
             evening_peak = max(hourly_demand[18:25]) if any(hourly_demand[18:25]) else 0
             overall_peak = max(hourly_demand[11:25]) if any(hourly_demand[11:25]) else 0
@@ -389,20 +388,32 @@ def solve_full_schedule(employees, all_reqs, relax=None, time_limit=8.0):
     return status, res  
 
 # ---------------------------------------------------------  
-# ΠΛΗΡΕΣ ΔΙΑΓΝΩΣΤΙΚΟ ΕΛΕΓΧΟΥ ΑΠΟΤΥΧΙΑΣ  
+# ΠΛΗΡΕΣ ΔΙΑΓΝΩΣΤΙΚΟ ΜΕ ΑΚΡΙΒΕΣ ΠΟΣΤΟ & ΗΜΕΡΑ  
 # ---------------------------------------------------------  
 def diagnose_schedule_failure(employees, all_reqs, status=None):  
-    reasons = []  
+    issues = []  
+    
     if status == cp_model.UNKNOWN:  
-        reasons.append("⏱️ **Χρονικό Όριο (Timeout):** Το πρόγραμμα είναι υπερβολικά περίπλοκο ή οριακό για τον solver μέσα στα διαθέσιμα δευτερόλεπτα.")  
-        return reasons  
+        issues.append({
+            "Πόστο": "Γενικό",
+            "Ημέρα": "Όλη την εβδομάδα",
+            "Τύπος Προβλήματος": "⏱️ Χρονικό Όριο (Timeout)",
+            "Ακριβής Αιτία & Λεπτομέρειες": "Ο αλγόριθμος εξάντλησε το χρονικό όριο. Το πρόγραμμα είναι υπερβολικά περίπλοκο ή οριακό."
+        })
+        return issues  
         
+    # 1. Έλεγχος διαθεσιμότητας ανά πόστο, ημέρα και ώρα
     for r in ROLES:  
         staff_r = [e for e in employees if e["role"] == r]  
         reqs_r = [rq for rq in all_reqs if rq["role"] == r]  
         
         if not staff_r and reqs_r:  
-            reasons.append(f"❌ **Έλλειψη Προσωπικού:** Δεν υπάρχει κανένας καταχωρημένος εργαζόμενος στο πόστο **{r}**!")  
+            issues.append({
+                "Πόστο": r,
+                "Ημέρα": "Όλες",
+                "Τύπος Προβλήματος": "❌ Έλλειψη Προσωπικού",
+                "Ακριβής Αιτία & Λεπτομέρειες": f"Δεν υπάρχει κανένας καταχωρημένος εργαζόμενος στο πόστο {r}."
+            })
             continue  
             
         for d in DAYS:  
@@ -420,11 +431,15 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
                         else:  
                             avail_here.append(e["name"])  
                     if len(avail_here) < needed:  
-                        reasons.append(  
-                            f"🚫 **{d} ({format_hour(h)} - {format_hour(h+1)}) στο {r}:** Χρειάζονται **{needed}** άτομα αλλά είναι διαθέσιμα μόνο **{len(avail_here)}** ({', '.join(avail_here) if avail_here else 'Κανένας'}). Απόντες: {', '.join(unavail_here)}."  
-                        )  
+                        issues.append({
+                            "Πόστο": r,
+                            "Ημέρα": d,
+                            "Τύπος Προβλήματος": "🚫 Έλλειψη Προσωπικού στη Βάρδια",
+                            "Ακριβής Αιτία & Λεπτομέρειες": f"Στις {format_hour(h)}-{format_hour(h+1)} απαιτούνται {needed} άτομα αλλά είναι διαθέσιμα μόνο {len(avail_here)} ({', '.join(avail_here) if avail_here else 'Κανένας'}). Απόντες: {', '.join(unavail_here)}."
+                        })
                         break  
                         
+    # 2. Έλεγχος συνολικών μεροκάματων ανά πόστο  
     for r in ROLES:  
         staff_r = [e for e in employees if e["role"] == r]  
         reqs_r = [rq for rq in all_reqs if rq["role"] == r]  
@@ -444,13 +459,22 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
             min_shifts_needed += d_shifts  
             
         if total_avail_shifts < min_shifts_needed:  
-            reasons.append(  
-                f"📈 **Ανεπάρκεια Μεροκάματων στο {r}:** Το πόστο απαιτεί τουλάχιστον **{min_shifts_needed}** βάρδιες/εβδομάδα, αλλά το προσωπικό προσφέρει συνολικά μόνο **{total_avail_shifts}** μεροκάματα. Αυξήστε τα επιθυμητά μεροκάματα κάποιου εργαζομένου (π.χ. σε 6) ή προσθέστε προσωπικό."  
-            )  
+            issues.append({
+                "Πόστο": r,
+                "Ημέρα": "Όλη την εβδομάδα",
+                "Τύπος Προβλήματος": "📈 Ανεπάρκεια Μεροκάματων",
+                "Ακριβής Αιτία & Λεπτομέρειες": f"Το πόστο απαιτεί τουλάχιστον {min_shifts_needed} βάρδιες/εβδομάδα, αλλά το προσωπικό προσφέρει συνολικά μόνο {total_avail_shifts} μεροκάματα. Αυξήστε τα επιθυμητά μεροκάματα κάποιου εργαζομένου ή προσθέστε άτομο."
+            })
             
+    # 3. Έλεγχος ναυτολογημένων Bar + Service ανά ημέρα & ώρα
     marines_bs = [e for e in employees if e["is_marine"] and e["role"] in ["Bar", "Service"]]  
     if len(marines_bs) < 2:  
-        reasons.append(f"⚓ **Έλλειψη Ναυτολογημένων:** Υπάρχουν μόνο **{len(marines_bs)}** ναυτολογημένοι σε Bar και Service, ενώ απαιτούνται τουλάχιστον **2** ταυτόχρονα.")  
+        issues.append({
+            "Πόστο": "Bar & Service",
+            "Ημέρα": "Όλες",
+            "Τύπος Προβλήματος": "⚓ Έλλειψη Ναυτολογημένων",
+            "Ακριβής Αιτία & Λεπτομέρειες": f"Υπάρχουν μόνο {len(marines_bs)} ναυτολογημένοι στο κατάστημα, ενώ απαιτούνται τουλάχιστον 2 ταυτόχρονα."
+        })
     else:  
         for d in DAYS:  
             for h in range(11, 25):  
@@ -467,33 +491,42 @@ def diagnose_schedule_failure(employees, all_reqs, status=None):
                         else:  
                             avail_mar.append(e["name"])  
                     if len(avail_mar) < 2:  
-                        reasons.append(  
-                            f"⚓ **Ναυτολόγηση {d} ({format_hour(h)}-{format_hour(h+1)}):** Απαιτούνται 2 ναυτολογημένοι στο σύνολο Bar+Service, αλλά είναι διαθέσιμοι μόνο **{len(avail_mar)}** ({', '.join(avail_mar) if avail_mar else 'Κανένας'}). Απόντες: {', '.join(unavail_mar)}."  
-                        )  
+                        issues.append({
+                            "Πόστο": "Bar & Service (Κοινό)",
+                            "Ημέρα": d,
+                            "Τύπος Προβλήματος": "⚓ Έλλειψη Ναυτολογημένων",
+                            "Ακριβής Αιτία & Λεπτομέρειες": f"Στις {format_hour(h)}-{format_hour(h+1)} απαιτούνται τουλάχιστον 2 ναυτολογημένοι, αλλά είναι διαθέσιμοι μόνο {len(avail_mar)} ({', '.join(avail_mar) if avail_mar else 'Κανένας'}). Απόντες: {', '.join(unavail_mar)}."
+                        })
                         break  
 
-    st_no_mar, _ = solve_full_schedule(employees, all_reqs, relax="no_marine", time_limit=2.0)  
-    if st_no_mar in (cp_model.OPTIMAL, cp_model.FEASIBLE):  
-        reasons.append("⚓ **Κανόνας 2 Ναυτολογημένων (Συνδυαστικός):** Οι ναυτολογημένοι δεν επαρκούν για να καλύψουν ταυτόχρονα όλες τις βάρδιες ναυτολόγησης (18:00-01:00) τηρώντας ταυτόχρονα το μέγιστο 10ωρο, τη μη-σπαστή βάρδια και τα ρεπό τους.")  
+    # 4. Συνδυαστικοί έλεγχοι αν δεν εντοπίστηκε απλή έλλειψη
+    st_no_mar, _ = solve_full_schedule(employees, all_reqs, relax="no_marine", time_limit=1.5)  
+    if st_no_mar in (cp_model.OPTIMAL, cp_model.FEASIBLE) and not any("⚓" in iss["Τύπος Προβλήματος"] for iss in issues):  
+        issues.append({
+            "Πόστο": "Bar & Service (Κοινό)",
+            "Ημέρα": "Πολλαπλές Ημέρες",
+            "Τύπος Προβλήματος": "⚓ Σύγκρουση Ναυτολόγησης & 10ώρου",
+            "Ακριβής Αιτία & Λεπτομέρειες": "Οι ναυτολογημένοι δεν μπορούν να καλύψουν ταυτόχρονα όλες τις βάρδιες ναυτολόγησης (18:00-01:00) τηρώντας το μέγιστο 10ωρο, τη μη-σπαστή βάρδια και τα ρεπό τους."
+        })
             
-    st_no_mar_hours, _ = solve_full_schedule(employees, all_reqs, relax="no_marine_hours", time_limit=2.0)  
-    if st_no_mar_hours in (cp_model.OPTIMAL, cp_model.FEASIBLE):  
-        reasons.append("⏱️ **Κανόνας 40 Ωρών Ναυτολόγησης:** Οι διαθέσιμες ζώνες και ώρες δεν επαρκούν ώστε κάθε ναυτολογημένος να συμπληρώσει τουλάχιστον 40 ώρες (μέγιστο 10 ώρες/ημέρα).")  
+    st_no_mar_hours, _ = solve_full_schedule(employees, all_reqs, relax="no_marine_hours", time_limit=1.5)  
+    if st_no_mar_hours in (cp_model.OPTIMAL, cp_model.FEASIBLE) and not any("40 Ωρών" in iss["Τύπος Προβλήματος"] for iss in issues):  
+        issues.append({
+            "Πόστο": "Bar & Service",
+            "Ημέρα": "Όλη την εβδομάδα",
+            "Τύπος Προβλήματος": "⏱️ Κανόνας 40 Ωρών Ναυτολόγησης",
+            "Ακριβής Αιτία & Λεπτομέρειες": "Οι διαθέσιμες ζώνες και ώρες δεν επαρκούν ώστε κάθε ναυτολογημένος να συμπληρώσει τουλάχιστον 40 ώρες (μέγιστο 10 ώρες/ημέρα)."
+        })
 
-    st_no_unavail, _ = solve_full_schedule(employees, all_reqs, relax="no_unavail", time_limit=2.0)  
-    if st_no_unavail in (cp_model.OPTIMAL, cp_model.FEASIBLE):  
-        if not any("🚫" in r for r in reasons):  
-            reasons.append("🚫 **Σύγκρουση Ρεπό / Κωλυμάτων:** Τα δηλωμένα ρεπό των υπαλλήλων συμπίπτουν.")  
-            
-    st_no_min_sh, _ = solve_full_schedule(employees, all_reqs, relax="no_min_shifts", time_limit=2.0)  
-    if st_no_min_sh in (cp_model.OPTIMAL, cp_model.FEASIBLE):  
-        if not any("Ανεπάρκεια Μεροκάματων" in r for r in reasons):  
-            reasons.append("📉 **Κανόνας Ελάχιστων Μεροκάματων (5+):** Υπάρχει αδυναμία κάλυψης του κανόνα 5+ μεροκάματων για όλους τους ναυτολογημένους.")  
-            
-    if not reasons:  
-        reasons.append("⚠️ **Σύνθετη Σύγκρουση Περιορισμών:** Συνδυασμός ορίων διάρκειας βάρδιας (4-10 ώρες), συνεχόμενου ωραρίου (όχι σπαστό) και απαιτήσεων ζωνών.")  
+    if not issues:  
+        issues.append({
+            "Πόστο": "Όλα τα Πόστα",
+            "Ημέρα": "Εβδομαδιαίο",
+            "Τύπος Προβλήματος": "⚠️ Σύνθετη Σύγκρουση Περιορισμών",
+            "Ακριβής Αιτία & Λεπτομέρειες": "Συνδυασμός ορίων διάρκειας βάρδιας (4-10 ώρες), συνεχόμενου ωραρίου (όχι σπαστό) και αλληλοεπικαλυπτόμενων αναγκών."
+        })
         
-    return reasons  
+    return issues  
 
 # ---------------------------------------------------------  
 # EXCEL EXPORT  
@@ -563,7 +596,7 @@ def create_styled_excel(df):
     output.seek(0)  
     return output  
   
-tab1, tab2, tab3 = st.tabs(["👤 Καρτέλα Υπαλλήλου", "⚙️ Ρυθμίσεις Manager (Ζώνες)", "📅 Τελικό Πρόγραμμα"])  
+tab1, tab2, tab3 = st.tabs(["👤 Καρτέλα Υπαλλήλου", "⚙️ Ρυθμίσεις Manager (Ζώνες & Έλεγχος)", "📅 Τελικό Πρόγραμμα"])  
 
 # ---------------------------------------------------------  
 # TAB 1: ΚΑΡΤΕΛΑ ΥΠΑΛΛΗΛΟΥ  
@@ -724,13 +757,100 @@ with tab1:
             st.rerun()  
 
 # ---------------------------------------------------------  
-# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER (LIVE PRE-CHECK & ΚΑΘΟΛΙΚΟΣ ΕΛΕΓΧΟΣ)  
+# TAB 2: ΡΥΘΜΙΣΕΙΣ MANAGER (DASHBOARD & ΠΡΟΛΗΠΤΙΚΟΣ ΕΛΕΓΧΟΣ)  
 # ---------------------------------------------------------  
 with tab2:  
     st.subheader("Διαχείριση Αναγκών & Ζωνών Προσωπικού")  
 
     top_banner_placeholder = st.empty()
 
+    # 1. VISUAL DASHBOARD ΔΙΑΘΕΣΙΜΟΤΗΤΑΣ ΑΝΑ ΠΟΣΤΟ
+    st.markdown("### 📊 Οπτικό Dashboard Διαθεσιμότητας ανά Πόστο")
+    st.caption("🔍 Επισκόπηση διαθεσιμότητας προσωπικού σε σχέση με τις ανάγκες του μαγαζιού ανά ημέρα. Τα κόκκινα κελιά υποδεικνύουν άμεσο έλλειμμα.")
+
+    dash_tabs = st.tabs(["🍸 Bar", "🍽️ Service", "🛎️ Υποδοχή"])
+    
+    current_matrix = st.session_state.zones_matrix
+    
+    for idx, r in enumerate(ROLES):
+        with dash_tabs[idx]:
+            staff_r = [e for e in st.session_state.employees if e["role"] == r]
+            role_rows = [row for row in current_matrix if row["Πόστο"] == r]
+            
+            # Υπολογισμός απαιτούμενου peak προσωπικού ανά ημέρα
+            daily_needed_peak = {}
+            for d in DAYS:
+                h_dem = [0] * 26
+                for row in role_rows:
+                    s_val, e_val, _ = get_slot_bounds(str(row["Ωράριο"]))
+                    count = int(row.get(d, 0) or 0)
+                    if count > 0:
+                        for h in range(s_val, e_val):
+                            h_dem[h] += count
+                m_peak = max(h_dem[11:18]) if any(h_dem[11:18]) else 0
+                e_peak = max(h_dem[18:25]) if any(h_dem[18:25]) else 0
+                daily_needed_peak[d] = max(m_peak, e_peak, max(h_dem[11:25]) if any(h_dem[11:25]) else 0)
+
+            dash_rows = []
+            for e in staff_r:
+                row_dict = {
+                    "Εργαζόμενος": f"{e['name']} ⚓" if e["is_marine"] else e["name"],
+                    "Μεροκάματα": f"{e['target_shifts']}/7"
+                }
+                for d in DAYS:
+                    u = e["unavailability"].get(d, {"status": "available"})
+                    if u["status"] == "all_day":
+                        row_dict[d] = "🔴 ΡΕΠΟ"
+                    elif u["status"] == "custom":
+                        row_dict[d] = f"🟡 {format_hour(u['start'])}-{format_hour(u['end'])}"
+                    else:
+                        row_dict[d] = "🟢 Διαθέσιμος"
+                dash_rows.append(row_dict)
+
+            # Γραμμή: Σύνολο Διαθέσιμων
+            avail_row = {"Εργαζόμενος": "👥 Σύνολο Διαθέσιμων", "Μεροκάματα": f"{sum(e['target_shifts'] for e in staff_r)}"}
+            for d in DAYS:
+                cnt = 0
+                for e in staff_r:
+                    if e["unavailability"].get(d, {}).get("status") != "all_day":
+                        cnt += 1
+                avail_row[d] = f"{cnt} άτομα"
+            dash_rows.append(avail_row)
+
+            # Γραμμή: Απαιτούμενο Προσωπικό (Peak)
+            needed_row = {"Εργαζόμενος": "📌 Απαιτούμενο Προσωπικό (Αιχμή)", "Μεροκάματα": "-"}
+            for d in DAYS:
+                needed_row[d] = f"{daily_needed_peak[d]} άτομα"
+            dash_rows.append(needed_row)
+
+            # Γραμμή: Ισοζύγιο / Κάλυψη
+            balance_row = {"Εργαζόμενος": "⚖️ Έλεγχος Κάλυψης", "Μεροκάματα": "-"}
+            for d in DAYS:
+                avail_cnt = sum(1 for e in staff_r if e["unavailability"].get(d, {}).get("status") != "all_day")
+                need_cnt = daily_needed_peak[d]
+                diff = avail_cnt - need_cnt
+                if diff < 0:
+                    balance_row[d] = f"🔴 Έλλειμμα ({diff})"
+                elif diff == 0:
+                    balance_row[d] = "⚠️ Οριακό (0)"
+                else:
+                    balance_row[d] = f"🟢 Πλήρης (+{diff})"
+            dash_rows.append(balance_row)
+
+            # Αν είναι Bar ή Service, προσθήκη γραμμής διαθέσιμων ναυτολογημένων
+            if r in ["Bar", "Service"]:
+                mar_row = {"Εργαζόμενος": "⚓ Διαθέσιμοι Ναυτολογημένοι", "Μεροκάματα": "-"}
+                for d in DAYS:
+                    m_cnt = sum(1 for e in staff_r if e["is_marine"] and e["unavailability"].get(d, {}).get("status") != "all_day")
+                    mar_row[d] = f"{m_cnt} ναυτ."
+                dash_rows.append(mar_row)
+
+            df_dash = pd.DataFrame(dash_rows)
+            st.dataframe(df_dash, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # 2. ΠΡΟΣΘΗΚΗ & ΔΙΑΓΡΑΦΗ ΖΩΝΗΣ
     col_tools_add, col_tools_del = st.columns(2)  
     with col_tools_add:  
         with st.expander("➕ Προσθήκη Νέας Ζώνης", expanded=False):  
@@ -771,6 +891,7 @@ with tab2:
                     st.success(f"Η ζώνη [{deleted_item['Πόστο']}] {deleted_item['Ωράριο']} διαγράφηκε!")  
                     st.rerun()  
 
+    # 3. ΠΛΗΡΩΣ ΕΠΕΞΕΡΓΑΣΙΜΟ ΤΑΜΠΛΟ ΖΩΝΩΝ
     st.markdown("#### 📊 Ταμπλό Ζωνών (Πλήρως Επεξεργάσιμο)")  
     st.caption("💡 Μπορείτε να κάνετε κλικ σε **οποιοδήποτε κελί** για άμεση αλλαγή (Πόστο, Ωράριο, Ναυτολόγηση, άτομα). Κάθε αλλαγή ελέγχεται προληπτικά σε πραγματικό χρόνο.")  
 
@@ -808,10 +929,11 @@ with tab2:
     
     # Πλήρης Προληπτική Επίλυση (Live Solver Pre-Check)
     pre_status, _ = solve_full_schedule(st.session_state.employees, current_reqs, time_limit=1.5)
-    pre_reasons = []
+    pre_issues = []
     if pre_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        pre_reasons = diagnose_schedule_failure(st.session_state.employees, current_reqs, pre_status)
+        pre_issues = diagnose_schedule_failure(st.session_state.employees, current_reqs, pre_status)
 
+    # Απόδοση στην κορυφή του Manager Tab
     with top_banner_placeholder.container():
         k1, k2, k3 = st.columns(3)  
         cols_k = [k1, k2, k3]  
@@ -829,9 +951,19 @@ with tab2:
         if pre_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             st.success("🟢 **Πλήρης Ετοιμότητα Προγράμματος:** Το πρόγραμμα είναι 100% επιλύσιμο! Όλες οι βάρδιες, τα ρεπό και οι ναυτολογήσεις (2 άτομα, 5+ μεροκάματα, 40+ ώρες) καλύπτονται άψογα.")
         else:
-            st.error(f"🔴 **ΠΡΟΕΙΔΟΠΟΙΗΣΗ: Το πρόγραμμα ΔΕΝ θα βγει! Εντοπίστηκαν {len(pre_reasons)} λόγοι εμπλοκής:**")
-            for reason in pre_reasons:
-                st.markdown(f"- {reason}")
+            st.error(f"🔴 **ΠΡΟΕΙΔΟΠΟΙΗΣΗ: Το πρόγραμμα ΔΕΝ θα βγει! Εντοπίστηκαν {len(pre_issues)} σημεία εμπλοκής:**")
+            df_issues = pd.DataFrame(pre_issues)
+            st.dataframe(
+                df_issues,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Πόστο": st.column_config.TextColumn("Πόστο", width="medium"),
+                    "Ημέρα": st.column_config.TextColumn("Ημέρα", width="medium"),
+                    "Τύπος Προβλήματος": st.column_config.TextColumn("Τύπος Προβλήματος", width="large"),
+                    "Ακριβής Αιτία & Λεπτομέρειες": st.column_config.TextColumn("Ακριβής Αιτία & Λεπτομέρειες", width="large"),
+                }
+            )
         st.divider()
 
 # ---------------------------------------------------------  
@@ -873,11 +1005,10 @@ with tab3:
             st.session_state.last_shifts_raw = []  
             persist_current_state()  
             
-            reasons = diagnose_schedule_failure(st.session_state.employees, active_reqs, status)  
+            issues = diagnose_schedule_failure(st.session_state.employees, active_reqs, status)  
             st.error("❌ **Αδύνατη η εύρεση νόμιμης λύσης!** Το πρόγραμμα δεν μπορεί να δημιουργηθεί χωρίς να παραβιαστούν βασικοί κανόνες.")  
-            st.markdown("### 🔍 Αιτίες Αδυναμίας Επίλυσης:")  
-            for r in reasons:  
-                st.markdown(f"- {r}")  
+            st.markdown("### 🔍 Ακριβής Εντοπισμός Προβλημάτων ανά Πόστο & Ημέρα:")  
+            st.dataframe(pd.DataFrame(issues), use_container_width=True, hide_index=True)  
             st.write("")  
 
     # ---------------------------------------------------------  
